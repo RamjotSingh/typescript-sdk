@@ -115,3 +115,5 @@ export const INVALID_REQUEST = -32_600;
 export const METHOD_NOT_FOUND = -32_601;
 export const INVALID_PARAMS = -32_602;
 export const INTERNAL_ERROR = -32_603;
+/** Prototype draft vocabulary: Authorization Lifetime SEP `AuthorizationEnded` error code. */
+export const AUTHORIZATION_ENDED = -32_028;

@@ -967,7 +967,9 @@ export const SubscriptionsAcknowledgedNotificationParamsSchema = NotificationsPa
     /**
      * The subset of requested notification types the server agreed to honor.
      */
-    notifications: SubscriptionFilterSchema
+    notifications: SubscriptionFilterSchema,
+    /** Prototype draft vocabulary: the stream's authorization deadline. */
+    authorizedUntil: z.string().optional()
 });
 
 /**
@@ -1001,6 +1003,9 @@ export const SubscriptionsListenResultMetaSchema = ResultMetaObjectSchema.extend
 export const SubscriptionsListenResultSchema = ResultSchema.extend({
     _meta: SubscriptionsListenResultMetaSchema
 });
+
+/** Prototype draft vocabulary: why a stream needs or ended authorization. */
+export const AuthorizationReasonSchema = z.string();
 
 /**
  * Parameters for a {@linkcode ResourceUpdatedNotification | notifications/resources/updated} notification.

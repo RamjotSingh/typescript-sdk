@@ -4,6 +4,7 @@
 // Add new constants in packages/core/src/constants.ts, never here — this file only forwards, and
 // core-internal's schemaShims test enforces that it stays free of zod imports and definitions.
 export {
+    AUTHORIZATION_ENDED,
     BAGGAGE_META_KEY,
     CLIENT_CAPABILITIES_META_KEY,
     CLIENT_INFO_META_KEY,

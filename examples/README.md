@@ -54,6 +54,7 @@ The one exception to the generic commands is the reference pair: [`cli-client/`]
 | [`oauth/`](./oauth/README.md)                                       | OAuth `authorization_code`: in-repo AS (auto-consent) + headless redirect-following client                                                                  | http         | dual           |
 | [`oauth-client-credentials/`](./oauth-client-credentials/README.md) | OAuth `client_credentials` (machine-to-machine): in-repo AS + `ClientCredentialsProvider`                                                                   | http         | dual           |
 | [`scoped-tools/`](./scoped-tools/README.md)                         | Per-tool scope on `createMcpHandler` — bearer-verify gate + handler-level `ctx.http?.authInfo` checks                                                       | http         | modern         |
+| [`authorization-lifetime/`](./authorization-lifetime/README.md)     | Prototype authorization lifetime story: deadlines, `AuthorizationEnded`, re-establishing streams, step-up, revocation, and older-client fallback            | http         | modern         |
 
 ## HTTP hosting variants
 

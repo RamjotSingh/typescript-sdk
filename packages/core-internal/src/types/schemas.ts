@@ -8,6 +8,7 @@
 export {
     AnnotationsSchema,
     AudioContentSchema,
+    AuthorizationReasonSchema,
     BaseMetadataSchema,
     BaseRequestParamsSchema,
     BlobResourceContentsSchema,

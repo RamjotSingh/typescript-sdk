@@ -34,6 +34,7 @@ import * as schemas from './schemas';
 const SPEC_SCHEMA_KEYS = [
     'AnnotationsSchema',
     'AudioContentSchema',
+    'AuthorizationReasonSchema',
     'BaseMetadataSchema',
     'BlobResourceContentsSchema',
     'BooleanSchemaSchema',

@@ -1210,7 +1210,9 @@ function build() {
         method: z.literal('notifications/subscriptions/acknowledged'),
         params: z.object({
             _meta: NotificationMetaSchema.optional(),
-            notifications: SubscriptionFilterSchema
+            notifications: SubscriptionFilterSchema,
+            // Prototype draft vocabulary: lifetime authorization deadline.
+            authorizedUntil: z.string().optional()
         })
     });
 

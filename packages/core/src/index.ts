@@ -21,6 +21,7 @@
 export {
     AnnotationsSchema,
     AudioContentSchema,
+    AuthorizationReasonSchema,
     BaseMetadataSchema,
     BlobResourceContentsSchema,
     BooleanSchemaSchema,

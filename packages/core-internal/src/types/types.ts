@@ -18,6 +18,7 @@ import type {
 import type {
     AnnotationsSchema,
     AudioContentSchema,
+    AuthorizationReasonSchema,
     BaseMetadataSchema,
     BaseRequestParamsSchema,
     BlobResourceContentsSchema,
@@ -383,6 +384,8 @@ export type SubscriptionsAcknowledgedNotificationParams = Infer<typeof Subscript
 export type SubscriptionsAcknowledgedNotification = Infer<typeof SubscriptionsAcknowledgedNotificationSchema>;
 export type SubscriptionsListenResultMeta = Infer<typeof SubscriptionsListenResultMetaSchema>;
 export type SubscriptionsListenResult = StripWireOnly<Infer<typeof SubscriptionsListenResultSchema>>;
+/** Prototype draft vocabulary: why a stream's authorization ended or needs attention. */
+export type AuthorizationReason = Infer<typeof AuthorizationReasonSchema>;
 
 /* Prompts */
 export type PromptArgument = Infer<typeof PromptArgumentSchema>;

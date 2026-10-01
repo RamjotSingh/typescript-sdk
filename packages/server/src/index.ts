@@ -60,6 +60,7 @@ export { createRequestStateCodec } from './server/requestStateCodec';
 export type { ServerOptions } from './server/server';
 export { Server } from './server/server';
 // subscriptions/listen change-event sourcing seam (protocol revision 2026-07-28).
+export type { AccessDecision, AccessTarget, StreamInfo, SubscriptionControl, SubscriptionLifetimeOptions } from './server/listenRouter';
 export type { ServerEvent, ServerEventBus, ServerNotifier } from './server/serverEventBus';
 export { InMemoryServerEventBus } from './server/serverEventBus';
 // StdioServerTransport and the serveStdio entry are exported from the './stdio' subpath — server stdio
