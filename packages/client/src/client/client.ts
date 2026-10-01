@@ -53,6 +53,7 @@ import type {
     XMcpHeaderScanResult
 } from '@modelcontextprotocol/core-internal';
 import {
+    AUTHORIZATION_ENDED,
     buildMcpParamHeaders,
     codecForVersion,
     DEFAULT_REQUEST_TIMEOUT_MSEC,
@@ -447,6 +448,14 @@ export interface McpSubscription {
      */
     readonly honoredFilter: SubscriptionFilter;
     /**
+     * The stream's authorization deadline, from the acknowledgment.
+     */
+    authorizedUntil?: string;
+    /**
+     * Why the server ended this stream with `AuthorizationEnded`, when known.
+     */
+    endReason?: 'token_expiry' | 'insufficient_authorization' | 'revoked' | string;
+    /**
      * Tears the subscription down. Idempotent. Aborts the listen request's
      * stream (where the transport supports it) AND sends
      * `notifications/cancelled` referencing the listen request id — both,
@@ -477,7 +486,17 @@ interface ListenStateEntry {
      * failure, ack timeout, caller-signal abort, `_resetConnectionState` —
      * routes through it.
      */
-    settle: (outcome: { ack: SubscriptionFilter } | { cause: 'local' | 'graceful' | 'remote'; error?: Error }) => void;
+    settle: (
+        outcome:
+            | {
+                  ack: {
+                      honoredFilter: SubscriptionFilter;
+                      authorizedUntil?: string;
+                  };
+              }
+            | { cause: 'local' | 'graceful' | 'remote'; error?: Error }
+    ) => void;
+    setEndReason: (reason: string | undefined) => void;
 }
 
 /**
@@ -1988,11 +2007,12 @@ export class Client extends Protocol<ClientContext> {
         // cancelled-before-ack / close-before-ack hangs are impossible by
         // construction.
         let state: 'opening' | 'open' | 'closed' = 'opening';
+        let honoredFilter: SubscriptionFilter = {};
         let ackTimer: ReturnType<typeof setTimeout> | undefined;
         let onCallerAbort: (() => void) | undefined;
-        let resolveOpening!: (honored: SubscriptionFilter) => void;
+        let resolveOpening!: () => void;
         let rejectOpening!: (error: Error) => void;
-        const opening = new Promise<SubscriptionFilter>((resolve, reject) => {
+        const opening = new Promise<void>((resolve, reject) => {
             resolveOpening = resolve;
             rejectOpening = reject;
         });
@@ -2005,7 +2025,19 @@ export class Client extends Protocol<ClientContext> {
             resolveClosed = resolve;
         });
 
-        const settle = (outcome: { ack: SubscriptionFilter } | { cause: 'local' | 'graceful' | 'remote'; error?: Error }): void => {
+        const subscription: McpSubscription = {
+            get honoredFilter() {
+                return honoredFilter;
+            },
+            close: async () => {
+                if (state === 'closed') return;
+                settle({ cause: 'local' });
+                await wireTeardown();
+            },
+            closed
+        };
+
+        const settle: ListenStateEntry['settle'] = outcome => {
             if (state === 'closed') return;
             const wasOpening = state === 'opening';
             if (ackTimer !== undefined) {
@@ -2016,7 +2048,9 @@ export class Client extends Protocol<ClientContext> {
                 // The single `opening → open` transition; an ack after close
                 // hits the `closed` guard above and is a no-op.
                 state = 'open';
-                resolveOpening(outcome.ack);
+                honoredFilter = outcome.ack.honoredFilter;
+                subscription.authorizedUntil = outcome.ack.authorizedUntil;
+                resolveOpening();
                 return;
             }
             state = 'closed';
@@ -2054,16 +2088,15 @@ export class Client extends Protocol<ClientContext> {
             await this.notification({ method: 'notifications/cancelled', params: { requestId: listenId } }).catch(() => {});
         };
 
-        const close = async (): Promise<void> => {
-            if (state === 'closed') return;
-            settle({ cause: 'local' });
-            await wireTeardown();
-        };
-
         // The per-subscription state is registered BEFORE the request is sent
         // so a synchronously-delivered ack (an in-process transport) cannot
         // race the registration.
-        this._listenState.set(listenId, { settle });
+        this._listenState.set(listenId, {
+            settle,
+            setEndReason: reason => {
+                subscription.endReason = reason;
+            }
+        });
 
         const ackTimeout = options?.timeout ?? DEFAULT_REQUEST_TIMEOUT_MSEC;
         ackTimer = setTimeout(() => {
@@ -2130,8 +2163,8 @@ export class Client extends Protocol<ClientContext> {
             routeSendFailure(error);
         }
 
-        const honored = await opening;
-        return { honoredFilter: honored, close, closed };
+        await opening;
+        return subscription;
     }
 
     /**
@@ -2201,7 +2234,14 @@ export class Client extends Protocol<ClientContext> {
                 // vocabulary): a malformed honored filter still settles the
                 // listen — `{}` means "nothing honored".
                 const honored = this._wireCodec().validateNotification('notifications/subscriptions/acknowledged', raw);
-                entry.settle({ ack: honored.ok ? honored.value.params.notifications : {} });
+                entry.settle({
+                    ack: honored.ok
+                        ? {
+                              honoredFilter: honored.value.params.notifications,
+                              authorizedUntil: honored.value.params.authorizedUntil
+                          }
+                        : { honoredFilter: {} }
+                });
                 return;
             }
         }
@@ -2236,6 +2276,10 @@ export class Client extends Protocol<ClientContext> {
         const entry = typeof id === 'string' ? this._listenState.get(id) : undefined;
         if (entry !== undefined) {
             if (isJSONRPCErrorResponse(response)) {
+                if (response.error.code === AUTHORIZATION_ENDED) {
+                    const reason = (response.error.data as { reason?: unknown } | undefined)?.reason;
+                    entry.setEndReason(typeof reason === 'string' ? reason : undefined);
+                }
                 entry.settle({
                     cause: 'remote',
                     error: ProtocolError.fromError(response.error.code, response.error.message, response.error.data)

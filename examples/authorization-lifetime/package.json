@@ -1,0 +1,33 @@
+{
+    "name": "@mcp-examples/authorization-lifetime",
+    "private": true,
+    "type": "module",
+    "scripts": {
+        "server": "tsx server.ts",
+        "client": "tsx client.ts",
+        "start": "tsx start.ts",
+        "start:fast": "tsx start.ts --fast"
+    },
+    "dependencies": {
+        "@mcp-examples/shared": "workspace:*",
+        "@modelcontextprotocol/client": "workspace:*",
+        "@modelcontextprotocol/node": "workspace:*",
+        "@modelcontextprotocol/server": "workspace:*",
+        "jose": "catalog:runtimeClientOnly",
+        "zod": "catalog:runtimeShared"
+    },
+    "devDependencies": {
+        "tsx": "catalog:devTools"
+    },
+    "example": {
+        "transports": [
+            "http"
+        ],
+        "era": "modern",
+        "timeoutMs": 120000,
+        "env": {
+            "DEMO_ACCESS_TOKEN_SECONDS": "20"
+        },
+        "//": "HTTP-only: the story includes a bearer-token authorization server and resource-server gate."
+    }
+}

@@ -9,6 +9,7 @@
 export const SPEC_SCHEMA_NAMES: ReadonlySet<string> = new Set([
     'AnnotationsSchema',
     'AudioContentSchema',
+    'AuthorizationReasonSchema',
     'BaseMetadataSchema',
     'BlobResourceContentsSchema',
     'BooleanSchemaSchema',

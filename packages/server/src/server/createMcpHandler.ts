@@ -60,6 +60,7 @@ import {
 } from '@modelcontextprotocol/core-internal';
 
 import { invoke } from './invoke';
+import type { SubscriptionControl, SubscriptionLifetimeOptions } from './listenRouter';
 import { createListenRouter, DEFAULT_MAX_SUBSCRIPTIONS } from './listenRouter';
 import { McpServer } from './mcp';
 import type { PerRequestResponseMode } from './perRequestTransport';
@@ -213,6 +214,8 @@ export interface CreateMcpHandlerOptions {
      * @default 4194304 (4 MiB)
      */
     maxRequestBodySize?: number;
+    /** Prototype draft vocabulary: the Authorization Lifetime SEP for subscription streams. */
+    subscriptionLifetime?: SubscriptionLifetimeOptions;
 }
 
 /**
@@ -249,6 +252,8 @@ export interface McpHttpHandler {
      * default).
      */
     bus: ServerEventBus;
+    /** Prototype draft vocabulary: control surface for active subscription streams. */
+    subscriptions: SubscriptionControl;
 }
 
 /* ------------------------------------------------------------------------ *
@@ -703,7 +708,8 @@ export function createMcpHandler(factory: McpServerFactory, options: CreateMcpHa
         bus,
         maxSubscriptions: options.maxSubscriptions ?? DEFAULT_MAX_SUBSCRIPTIONS,
         keepAliveMs: options.keepAliveMs ?? DEFAULT_SSE_KEEP_ALIVE_MS,
-        onerror: reportError
+        onerror: reportError,
+        subscriptionLifetime: options.subscriptionLifetime
     });
     if (responseMode === 'json') {
         // eslint-disable-next-line no-console
@@ -802,7 +808,7 @@ export function createMcpHandler(factory: McpServerFactory, options: CreateMcpHa
             const capabilities = server.getCapabilities();
             const serverInfo = serverIdentityOf(server);
             void product.close().catch(reportError);
-            return listenRouter.serve(route.message, request.signal, capabilities, serverInfo);
+            return listenRouter.serve(route.message, request.signal, capabilities, serverInfo, authInfo);
         }
 
         // SEP-2243 `Mcp-Param-*` server-side validation (pre-dispatch ladder
@@ -1003,6 +1009,7 @@ export function createMcpHandler(factory: McpServerFactory, options: CreateMcpHa
         fetch: fetchFace,
         notify,
         bus,
+        subscriptions: listenRouter.subscriptions,
         close: async () => {
             closed = true;
             listenRouter.closeAll();
