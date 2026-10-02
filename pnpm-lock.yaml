@@ -1244,6 +1244,31 @@ importers:
         specifier: catalog:devTools
         version: 4.21.0
 
+  examples/subscription-lifecycle:
+    dependencies:
+      '@mcp-examples/shared':
+        specifier: workspace:*
+        version: link:../shared
+      '@modelcontextprotocol/client':
+        specifier: workspace:*
+        version: link:../../packages/client
+      '@modelcontextprotocol/node':
+        specifier: workspace:*
+        version: link:../../packages/middleware/node
+      '@modelcontextprotocol/server':
+        specifier: workspace:*
+        version: link:../../packages/server
+      jose:
+        specifier: catalog:runtimeClientOnly
+        version: 6.2.2
+      zod:
+        specifier: catalog:runtimeShared
+        version: 4.3.6
+    devDependencies:
+      tsx:
+        specifier: catalog:devTools
+        version: 4.21.0
+
   examples/subscriptions:
     dependencies:
       '@hono/node-server':

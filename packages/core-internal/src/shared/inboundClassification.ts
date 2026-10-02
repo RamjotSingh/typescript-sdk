@@ -468,7 +468,7 @@ function crossCheckMismatch(
 }
 
 /** The body field the `Mcp-Name` header mirrors for a method on {@linkcode MCP_NAME_HEADER_SOURCE}. */
-export type McpNameSourceField = 'name' | 'uri' | 'taskId';
+export type McpNameSourceField = 'name' | 'uri' | 'taskId' | 'handle';
 
 /**
  * The methods whose body carries a `params.name` / `params.uri` /
@@ -488,7 +488,9 @@ export const MCP_NAME_HEADER_SOURCE: Readonly<Record<string, McpNameSourceField>
     'resources/read': 'uri',
     'tasks/get': 'taskId',
     'tasks/update': 'taskId',
-    'tasks/cancel': 'taskId'
+    'tasks/cancel': 'taskId',
+    // Prototype draft vocabulary: route updates to the stream-holding instance.
+    'subscriptions/update': 'handle'
 };
 
 /**

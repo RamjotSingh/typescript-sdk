@@ -276,14 +276,16 @@ describe('SEP-2243 standard-header validation (Mcp-Name presence and cross-check
         expect(validateStandardRequestHeaders(request, route)).toBeUndefined();
     });
 
-    test('the Mcp-Name source map covers exactly the spec table (SEP-2243 core + SEP-2663 tasks)', () => {
+    test('the Mcp-Name source map covers exactly the spec table plus prototype draft subscription routing', () => {
         expect(MCP_NAME_HEADER_SOURCE).toEqual({
             'tools/call': 'name',
             'prompts/get': 'name',
             'resources/read': 'uri',
             'tasks/get': 'taskId',
             'tasks/update': 'taskId',
-            'tasks/cancel': 'taskId'
+            'tasks/cancel': 'taskId',
+            // Prototype draft vocabulary: Subscription Lifecycle SEP update routing.
+            'subscriptions/update': 'handle'
         });
     });
 

@@ -9,7 +9,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createMcpHandler } from '../../src/server/createMcpHandler';
 import { requireBearerAuth } from '../../src/server/middleware/bearerAuth';
 import type { McpHttpHandler } from '../../src/server/createMcpHandler';
-import type { AccessDecision, AccessTarget, SubscriptionLifetimeOptions } from '../../src/server/listenRouter';
+import type {
+    AccessDecision,
+    AccessTarget,
+    SubscriptionLifecycleOptions,
+    SubscriptionLifetimeOptions
+} from '../../src/server/listenRouter';
 import { McpServer } from '../../src/server/mcp';
 
 const MODERN_REVISION = '2026-07-28';
@@ -83,6 +88,18 @@ function lifetimeHandler(options: SubscriptionLifetimeOptions = {}): McpHttpHand
     return createMcpHandler(factory, { keepAliveMs: 0, subscriptionLifetime: { now: () => clock, ...options } });
 }
 
+/** A server that implements both SEPs. */
+function handler(
+    options: Pick<SubscriptionLifetimeOptions, 'authorize' | 'maxAuthorizationLifetimeMs'> & SubscriptionLifecycleOptions = {}
+): McpHttpHandler {
+    const { authorize, maxAuthorizationLifetimeMs, ...lifecycle } = options;
+    return createMcpHandler(factory, {
+        keepAliveMs: 0,
+        subscriptionLifetime: { now: () => clock, authorize, maxAuthorizationLifetimeMs },
+        subscriptionLifecycle: { random: () => 0, ...lifecycle }
+    });
+}
+
 function listenRequest(
     id: string | number,
     notifications: Record<string, unknown>,
@@ -102,6 +119,30 @@ function listenRequest(
             id,
             method: 'subscriptions/listen',
             params: { _meta: envelope(draft), notifications, ...extra }
+        })
+    });
+}
+
+function updateRequest(
+    id: string | number,
+    handle: string,
+    params: Record<string, unknown> = {},
+    options: { mcpName?: string; draft?: boolean } = {}
+): Request {
+    return new Request('http://localhost/mcp', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+            'mcp-protocol-version': MODERN_REVISION,
+            'mcp-method': 'subscriptions/update',
+            'mcp-name': options.mcpName ?? handle
+        },
+        body: JSON.stringify({
+            jsonrpc: '2.0',
+            id,
+            method: 'subscriptions/update',
+            params: { _meta: envelope(options.draft ?? true), handle, ...params }
         })
     });
 }
@@ -257,6 +298,30 @@ describe('Lifetime SEP server tests', () => {
         await h.close();
     });
 
+    it('lifetime SEP §3 rule 2 and lifecycle SEP §3.5: authorize unavailable drops, keeps the entry, and sends missed', async () => {
+        const h = handler({ authorize: () => 'unavailable' });
+        const { stream } = await open(h, 1, { resourceSubscriptions: ['file:///a'], lifecycle: true });
+        h.notify.resourceUpdated('file:///a');
+        expect(await stream.next()).toMatchObject({ method: 'notifications/subscriptions/lifecycle', params: { type: 'missed' } });
+        expect(h.subscriptions.list()[0]?.acknowledged.resourceSubscriptions).toEqual(['file:///a']);
+        await h.close();
+    });
+
+    it('lifetime SEP §3 rule 5 + lifecycle SEP §3.4 rule 4: last entry removal ends with revoked no earlier than the next reminder', async () => {
+        let deny = false;
+        const h = handler({ authorize: () => (deny ? 'deny' : 'allow'), random: () => 0 });
+        const { stream } = await open(h, 1, { resourceSubscriptions: ['file:///a'], lifecycle: true }, auth(clock + 1_000));
+        const initialUpdatedAt = h.subscriptions.list()[0]?.lastUpdatedAt;
+        deny = true;
+        h.notify.resourceUpdated('file:///a');
+        await stream.expectNoMessage();
+        expect(h.subscriptions.list()[0]?.lastUpdatedAt).toBe(initialUpdatedAt);
+        await advance(900);
+        expect(await stream.next()).toMatchObject({ method: 'notifications/subscriptions/lifecycle', params: { type: 'access_reduced' } });
+        expect(await stream.next()).toMatchObject({ error: { code: -32_023, data: { reason: 'revoked' } } });
+        await h.close();
+    });
+
     it('lifetime SEP §3 rule 4: revoke() ends matching streams at once with revoked, leaves non-matching streams, and returns count', async () => {
         const h = lifetimeHandler();
         const one = await open(h, 'one', { resourceSubscriptions: ['file:///a'] });
@@ -319,6 +384,373 @@ describe('Lifetime SEP server tests', () => {
     });
 });
 
+describe('Lifecycle SEP server tests', () => {
+    it('lifecycle SEP §3.1: lifecycle is acknowledged only when requested and no lifecycle notifications are sent otherwise', async () => {
+        const h = handler({ authorize: () => 'unavailable' });
+        const noLifecycle = await open(h, 1, { resourceSubscriptions: ['file:///a'] });
+        expect(noLifecycle.ack.params?.notifications).not.toHaveProperty('lifecycle');
+        h.notify.resourceUpdated('file:///a');
+        await noLifecycle.stream.expectNoMessage();
+
+        const withLifecycle = await open(h, 2, { resourceSubscriptions: ['file:///a'], lifecycle: true });
+        expect(withLifecycle.ack.params?.notifications).toMatchObject({ lifecycle: true });
+        h.notify.resourceUpdated('file:///a');
+        expect(await withLifecycle.stream.next()).toMatchObject({
+            method: 'notifications/subscriptions/lifecycle',
+            params: { type: 'missed' }
+        });
+        await h.close();
+    });
+
+    it('lifecycle SEP §2 rule 1: uses requested expiresAt exactly and rejects past expiresAt with -32602', async () => {
+        const h = handler();
+        const requested = iso(clock + 5_000);
+        const { ack } = await open(h, 1, { resourceSubscriptions: ['file:///a'] }, auth(clock + 60_000), { expiresAt: requested });
+        expect(ack.params?.expiresAt).toBe(requested);
+
+        const response = await h.fetch(listenRequest(2, { resourceSubscriptions: ['file:///a'] }, { expiresAt: iso(clock - 1) }), {
+            authInfo: auth(clock + 60_000)
+        });
+        expect(await json(response)).toMatchObject({ error: { code: -32_602, message: 'Invalid expiresAt' } });
+        await h.close();
+    });
+
+    it('lifecycle SEP §2 rule 1: rejects expiresAt beyond the maximum with -32602 and maxExpiresAt', async () => {
+        const h = handler({ maxStreamLifetimeMs: 10_000 });
+        const response = await h.fetch(listenRequest(1, { resourceSubscriptions: ['file:///a'] }, { expiresAt: iso(clock + 10_001) }), {
+            authInfo: auth(clock + 60_000)
+        });
+        expect(await json(response)).toMatchObject({ error: { code: -32_602, data: { maxExpiresAt: iso(clock + 10_000) } } });
+        await h.close();
+    });
+
+    it('lifecycle SEP §2 rules 1-3: omitted expiresAt uses server maximum and ends at expiry with completion result while paused', async () => {
+        const h = handler({ maxStreamLifetimeMs: 2_000, reminderLeadsMs: () => [] });
+        const { stream, ack } = await open(h, 1, { resourceSubscriptions: ['file:///a'], lifecycle: true }, auth(clock + 1_000));
+        expect(ack.params?.expiresAt).toBe(iso(clock + 2_000));
+        await advance(1_000);
+        expect(await stream.next()).toMatchObject({
+            method: 'notifications/subscriptions/lifecycle',
+            params: { type: 'reauthorization_required' }
+        });
+        await advance(1_000);
+        expect(await stream.next()).toMatchObject({ id: 1, result: { resultType: 'complete' } });
+        await h.close();
+    });
+
+    it('lifecycle SEP §2 rule 3: expiry coinciding with authorization deadline sends completion result, not AuthorizationEnded', async () => {
+        const h = handler();
+        const { stream } = await open(h, 1, { resourceSubscriptions: ['file:///a'] }, auth(clock + 1_000), {
+            expiresAt: iso(clock + 1_000)
+        });
+        await advance(1_000);
+        const final = (await stream.next()) as JsonMessage;
+        expect(final.result).toMatchObject({ resultType: 'complete' });
+        expect(final).not.toHaveProperty('error');
+        await h.close();
+    });
+
+    it('lifecycle SEP §3.3 rule 2: default reminders for <10 min use 10/5/3/2/1 percent with first jittered earlier', async () => {
+        const h = handler({ random: () => 0.5 });
+        const { stream } = await open(h, 1, { resourceSubscriptions: ['file:///a'], lifecycle: true }, auth(clock + 100_000));
+        await advance(89_499);
+        await stream.expectNoMessage();
+        await advance(1);
+        expect(await stream.next()).toMatchObject({ params: { type: 'reauthorization_required', authorizedUntil: iso(clock + 10_500) } });
+        await h.close();
+    });
+
+    it('lifecycle SEP §3.3 rule 2: default reminders for >=10 min use 60/30/15/10/5 second leads', async () => {
+        const h = handler({ random: () => 0 });
+        const { stream } = await open(h, 1, { resourceSubscriptions: ['file:///a'], lifecycle: true }, auth(clock + 600_000));
+        await advance(540_000);
+        expect(await stream.next()).toMatchObject({ params: { type: 'reauthorization_required' } });
+        await h.close();
+    });
+
+    it('lifecycle SEP §3.3 rule 1: no reminders precede an expiry that comes before the authorization deadline', async () => {
+        const h = handler();
+        const { stream } = await open(h, 1, { resourceSubscriptions: ['file:///a'], lifecycle: true }, auth(clock + 60_000), {
+            expiresAt: iso(clock + 500)
+        });
+        await advance(500);
+        const final = (await stream.next()) as JsonMessage;
+        expect(final.result).toMatchObject({ resultType: 'complete' });
+        expect(JSON.stringify(final)).not.toContain('reauthorization_required');
+        await h.close();
+    });
+
+    it('lifecycle SEP §3.3 rule 4 and §4 rule 2: requireScopes sends immediate insufficient_authorization reminder, 403 challenge, then scoped update succeeds', async () => {
+        const h = handler();
+        const { stream, ack } = await open(h, 1, { resourceSubscriptions: ['file:///a'], lifecycle: true }, auth(clock + 60_000, ['read']));
+        h.subscriptions.requireScopes(['audit'], clock + 5_000);
+        expect(await stream.next()).toMatchObject({
+            params: { type: 'reauthorization_required', reason: 'insufficient_authorization', authorizedUntil: iso(clock + 5_000) }
+        });
+
+        const forbidden = await h.fetch(updateRequest(2, ack.params?.handle as string), { authInfo: auth(clock + 70_000, ['read']) });
+        expect(forbidden.status).toBe(403);
+        expect(forbidden.headers.get('www-authenticate')).toContain('error="insufficient_scope"');
+        expect(forbidden.headers.get('www-authenticate')).toContain('read audit');
+
+        const ok = await h.fetch(updateRequest(3, ack.params?.handle as string), { authInfo: auth(clock + 70_000, ['read', 'audit']) });
+        expect(await json(ok)).toMatchObject({ result: { authorizedUntil: iso(clock + 70_000) } });
+        await h.close();
+    });
+
+    it('lifecycle SEP §5 rules 1-2: at the deadline lifecycle+handle pauses and repeats only lifecycle reminders', async () => {
+        const h = handler({ pausedReminderIntervalMs: 60_000 });
+        const { stream } = await open(h, 1, { resourceSubscriptions: ['file:///a'], lifecycle: true }, auth(clock + 1_000));
+        await advance(1_000);
+        expect(h.subscriptions.list()[0]?.state).toBe('paused');
+        expect(await stream.next()).toMatchObject({
+            method: 'notifications/subscriptions/lifecycle',
+            params: { type: 'reauthorization_required' }
+        });
+        h.notify.resourceUpdated('file:///a');
+        await advance(60_000);
+        expect(await stream.next()).toMatchObject({
+            method: 'notifications/subscriptions/lifecycle',
+            params: { type: 'reauthorization_required' }
+        });
+        await h.close();
+    });
+
+    it('lifecycle SEP §5: lifecycle stream without a handle ends at the deadline instead of pausing', async () => {
+        const h = handler({ inPlaceUpdates: false, reminderLeadsMs: () => [] });
+        const { stream, ack } = await open(h, 1, { resourceSubscriptions: ['file:///a'], lifecycle: true }, auth(clock + 1_000));
+        expect(ack.params).not.toHaveProperty('handle');
+        await advance(1_000);
+        expect(await stream.next()).toMatchObject({ error: { code: -32_023, data: { reason: 'token_expiry' } } });
+        await h.close();
+    });
+
+    it('lifecycle SEP §5 rules 4-5: held notifications while paused are delivered after update in order and re-checked', async () => {
+        const denied = new Set<string>();
+        const h = handler({
+            reminderLeadsMs: () => [],
+            authorize: (_auth, target) => (target.kind === 'resource' && denied.has(target.uri) ? 'deny' : 'allow')
+        });
+        const { stream, ack } = await open(
+            h,
+            1,
+            { resourceSubscriptions: ['file:///a', 'file:///b'], lifecycle: true },
+            auth(clock + 1_000)
+        );
+        await advance(1_000);
+        await stream.next();
+        h.notify.resourceUpdated('file:///a');
+        h.notify.resourceUpdated('file:///b');
+        denied.add('file:///b');
+        await h.fetch(updateRequest(2, ack.params?.handle as string), { authInfo: auth(clock + 60_000) });
+        await Promise.resolve();
+        expect(await stream.next()).toMatchObject({ method: 'notifications/subscriptions/lifecycle', params: { type: 'access_reduced' } });
+        expect(await stream.next()).toMatchObject({ method: 'notifications/resources/updated', params: { uri: 'file:///a' } });
+        await stream.expectNoMessage();
+        await h.close();
+    });
+
+    it('lifecycle SEP §5 rules 4-5: hold false drops paused notifications and sends missed after update', async () => {
+        const h = handler({ hold: false, reminderLeadsMs: () => [] });
+        const { stream, ack } = await open(h, 1, { resourceSubscriptions: ['file:///a'], lifecycle: true }, auth(clock + 1_000));
+        await advance(1_000);
+        await stream.next();
+        h.notify.resourceUpdated('file:///a');
+        await h.fetch(updateRequest(2, ack.params?.handle as string), { authInfo: auth(clock + 60_000) });
+        await Promise.resolve();
+        expect(await stream.next()).toMatchObject({ method: 'notifications/subscriptions/lifecycle', params: { type: 'missed' } });
+        await h.close();
+    });
+
+    it('lifecycle SEP §5 rule 4: hold cap drops excess and sends missed after update', async () => {
+        const h = handler({ hold: { maxNotifications: 1 }, reminderLeadsMs: () => [] });
+        const { stream, ack } = await open(
+            h,
+            1,
+            { resourceSubscriptions: ['file:///a', 'file:///b'], lifecycle: true },
+            auth(clock + 1_000)
+        );
+        await advance(1_000);
+        await stream.next();
+        h.notify.resourceUpdated('file:///a');
+        h.notify.resourceUpdated('file:///b');
+        await h.fetch(updateRequest(2, ack.params?.handle as string), { authInfo: auth(clock + 60_000) });
+        await Promise.resolve();
+        expect(await stream.next()).toMatchObject({ method: 'notifications/resources/updated', params: { uri: 'file:///a' } });
+        expect(await stream.next()).toMatchObject({ method: 'notifications/subscriptions/lifecycle', params: { type: 'missed' } });
+        await h.close();
+    });
+
+    it('lifecycle SEP §5 rule 4: held notifications are written only to their own stream', async () => {
+        const h = handler({ reminderLeadsMs: () => [] });
+        const one = await open(h, 'one', { resourceSubscriptions: ['file:///a'], lifecycle: true }, auth(clock + 1_000));
+        const two = await open(h, 'two', { resourceSubscriptions: ['file:///a'], lifecycle: true }, auth(clock + 60_000));
+        await advance(1_000);
+        await one.stream.next();
+        h.notify.resourceUpdated('file:///a');
+        expect(await two.stream.next()).toMatchObject({ method: 'notifications/resources/updated', params: { uri: 'file:///a' } });
+        await h.fetch(updateRequest(2, one.ack.params?.handle as string), { authInfo: auth(clock + 60_000) });
+        await Promise.resolve();
+        expect(await one.stream.next()).toMatchObject({ method: 'notifications/resources/updated', params: { uri: 'file:///a' } });
+        await two.stream.expectNoMessage();
+        await h.close();
+    });
+
+    it('lifecycle SEP §3.4 rule 3: access_reduced is held until reminder and lastUpdatedAt does not move until sent', async () => {
+        let denyB = false;
+        const h = handler({
+            authorize: (_auth, target) => (target.kind === 'resource' && target.uri === 'file:///b' && denyB ? 'deny' : 'allow')
+        });
+        const { stream } = await open(h, 1, { resourceSubscriptions: ['file:///a', 'file:///b'], lifecycle: true }, auth(clock + 1_000));
+        denyB = true;
+        const initial = h.subscriptions.list()[0]?.lastUpdatedAt;
+        h.notify.resourceUpdated('file:///b');
+        await stream.expectNoMessage();
+        expect(h.subscriptions.list()[0]?.lastUpdatedAt).toBe(initial);
+        await advance(900);
+        expect(await stream.next()).toMatchObject({ method: 'notifications/subscriptions/lifecycle', params: { type: 'access_reduced' } });
+        expect(h.subscriptions.list()[0]?.lastUpdatedAt).not.toBe(initial);
+        await h.close();
+    });
+
+    it('lifecycle SEP §3.4 rule 1: recheckAccess sends access_reduced at once', async () => {
+        let denyB = false;
+        const h = handler({
+            authorize: (_auth, target) => (target.kind === 'resource' && target.uri === 'file:///b' && denyB ? 'deny' : 'allow')
+        });
+        const { stream } = await open(h, 1, { resourceSubscriptions: ['file:///a', 'file:///b'], lifecycle: true });
+        denyB = true;
+        await h.subscriptions.recheckAccess();
+        expect(await stream.next()).toMatchObject({ method: 'notifications/subscriptions/lifecycle', params: { type: 'access_reduced' } });
+        await h.close();
+    });
+
+    it('lifecycle SEP §4 rule 5: successful update keeps stream open, advances lastUpdatedAt, and delivers past old token expiry', async () => {
+        const h = handler();
+        const { stream, ack } = await open(h, 1, { resourceSubscriptions: ['file:///a'], lifecycle: true }, auth(clock + 1_000));
+        const oldUpdated = ack.params?.lastUpdatedAt as string;
+        const response = await h.fetch(updateRequest(2, ack.params?.handle as string), { authInfo: auth(clock + 60_000) });
+        const body = await json(response);
+        expect(body.result?.authorizedUntil).toBe(iso(clock + 60_000));
+        expect((body.result?.lastUpdatedAt as string) > oldUpdated).toBe(true);
+        await advance(1_001);
+        h.notify.resourceUpdated('file:///a');
+        expect(await stream.next()).toMatchObject({ method: 'notifications/resources/updated', params: { uri: 'file:///a' } });
+        await h.close();
+    });
+
+    it('lifecycle SEP §4 rule 3: unknown, ended, different clientId, and different subject all return generic -32602', async () => {
+        const h = handler();
+        const { stream, ack } = await open(h, 1, { resourceSubscriptions: ['file:///a'], lifecycle: true });
+        for (const [request, authInfo] of [
+            [updateRequest(2, 'missing'), auth(clock + 60_000)],
+            [updateRequest(3, ack.params?.handle as string), auth(clock + 60_000, ['read'], 'alice', 'client-b')],
+            [updateRequest(4, ack.params?.handle as string), auth(clock + 60_000, ['read'], 'bob')]
+        ] as const) {
+            expect(await json(await h.fetch(request, { authInfo }))).toMatchObject({
+                error: { code: -32_602, message: 'Unknown subscription handle' }
+            });
+        }
+        h.subscriptions.revoke();
+        await stream.next();
+        expect(await json(await h.fetch(updateRequest(5, ack.params?.handle as string), { authInfo: auth(clock + 60_000) }))).toMatchObject(
+            {
+                error: { code: -32_602, message: 'Unknown subscription handle' }
+            }
+        );
+        await h.close();
+    });
+
+    it('lifecycle SEP §4 rules 3-4: an unsupported field, and -32602 naming the entries when none is permitted, do not change the stream', async () => {
+        let denyA = false;
+        const h = handler({
+            authorize: (_auth, target) => (target.kind === 'resource' && target.uri === 'file:///a' && denyA ? 'deny' : 'allow')
+        });
+        const { stream, ack } = await open(h, 1, { resourceSubscriptions: ['file:///a'], lifecycle: true });
+        denyA = true;
+        const before = h.subscriptions.list()[0];
+        expect(
+            await json(await h.fetch(updateRequest(2, ack.params?.handle as string, { extra: true }), { authInfo: auth(clock + 60_000) }))
+        ).toMatchObject({
+            error: { code: -32_602, data: { unsupportedFields: ['extra'] } }
+        });
+        const refused = await h.fetch(updateRequest(3, ack.params?.handle as string), { authInfo: auth(clock + 60_000) });
+        expect(refused.status).toBe(200);
+        expect(await json(refused)).toEqual({
+            jsonrpc: '2.0',
+            error: { code: -32_602, message: 'Not permitted', data: { denied: { resourceSubscriptions: ['file:///a'] } } },
+            id: 3
+        });
+        expect(h.subscriptions.list()[0]).toEqual(before);
+        h.notify.resourceUpdated('file:///a');
+        await stream.expectNoMessage();
+        await h.close();
+    });
+
+    it('lifecycle SEP §4 rule 4: same update twice yields the same result and expiresAt:null removes requested expiry under server max', async () => {
+        const h = handler({ maxStreamLifetimeMs: 120_000 });
+        const { ack } = await open(h, 1, { resourceSubscriptions: ['file:///a'], lifecycle: true }, auth(clock + 60_000), {
+            expiresAt: iso(clock + 30_000)
+        });
+        const first = await json(
+            await h.fetch(updateRequest(2, ack.params?.handle as string, { expiresAt: null }), { authInfo: auth(clock + 70_000) })
+        );
+        const second = await json(
+            await h.fetch(updateRequest(3, ack.params?.handle as string, { expiresAt: null }), { authInfo: auth(clock + 70_000) })
+        );
+        expect(second.result).toEqual(first.result);
+        expect(first.result?.expiresAt).toBe(iso(clock + 120_000));
+        await h.close();
+    });
+
+    it('lifecycle SEP §4 rule 3: subscriptions/update with mismatched Mcp-Name is rejected by the standard-header rung', async () => {
+        const h = handler();
+        const { ack } = await open(h, 1, { resourceSubscriptions: ['file:///a'], lifecycle: true });
+        const response = await h.fetch(updateRequest(2, ack.params?.handle as string, {}, { mcpName: 'wrong' }), {
+            authInfo: auth(clock + 60_000)
+        });
+        expect(response.status).toBe(400);
+        expect(await json(response)).toMatchObject({ error: { code: -32_020 } });
+        await h.close();
+    });
+
+    it('lifecycle SEP Backward Compatibility: a server without subscriptionLifecycle ignores lifecycle and expiresAt, and acknowledges with authorizedUntil alone', async () => {
+        const h = lifetimeHandler();
+        const { ack } = await open(h, 1, { resourceSubscriptions: ['file:///a'], lifecycle: true }, auth(clock + 60_000), {
+            expiresAt: iso(clock - 1)
+        });
+        expect(ack.params?.authorizedUntil).toBe(iso(clock + 60_000));
+        expect(ack.params?.notifications).toEqual({ resourceSubscriptions: ['file:///a'] });
+        expect(ack.params).not.toHaveProperty('expiresAt');
+        expect(ack.params).not.toHaveProperty('lastUpdatedAt');
+        expect(ack.params).not.toHaveProperty('handle');
+        await h.close();
+    });
+
+    it('lifecycle SEP Backward Compatibility: a server without subscriptionLifecycle sends no lifecycle notification and ends the stream at the deadline', async () => {
+        const h = lifetimeHandler();
+        const { stream } = await open(h, 1, { resourceSubscriptions: ['file:///a'], lifecycle: true }, auth(clock + 10_000));
+        await advance(10_000);
+        const end = (await stream.next()) as JsonMessage;
+        expect(end).toMatchObject({ id: 1, error: { code: -32_023, data: { reason: 'token_expiry' } } });
+        expect(await stream.next()).toBeUndefined();
+        await h.close();
+    });
+
+    it('lifecycle SEP Backward Compatibility: a server without subscriptionLifecycle answers subscriptions/update with -32601', async () => {
+        const h = lifetimeHandler();
+        const response = await h.fetch(updateRequest(2, 'any-handle'), { authInfo: auth(clock + 60_000) });
+        expect(await json(response)).toMatchObject({ id: 2, error: { code: -32_601 } });
+        await h.close();
+    });
+});
+
+describe('prototype options', () => {
+    it('subscriptionLifecycle without subscriptionLifetime is rejected when the handler is created', () => {
+        expect(() => createMcpHandler(factory, { subscriptionLifecycle: {} })).toThrow(TypeError);
+    });
+});
+
 /** Denies tool list changes and `file:///b`, cannot decide `file:///c`, and allows everything else. */
 function partlyDenied(_auth: AuthInfo | undefined, target: AccessTarget): AccessDecision {
     if (target.kind === 'toolsList' || (target.kind === 'resource' && target.uri === 'file:///b')) return 'deny';
@@ -375,6 +807,27 @@ describe('open-time authorization', () => {
         h.notify.resourceUpdated('file:///a');
         expect(await stream.next()).toMatchObject({ method: 'notifications/resources/updated', params: { uri: 'file:///a' } });
         expect(h.subscriptions.list()).toHaveLength(1);
+        await h.close();
+    });
+
+    it('lifecycle SEP §3.4 rule 5: open-time unavailable keeps the entry in the acknowledgment', async () => {
+        const h = handler({
+            authorize: (_auth, target) => (target.kind === 'resource' && target.uri === 'file:///b' ? 'unavailable' : 'allow')
+        });
+        const { ack } = await open(h, 1, { resourceSubscriptions: ['file:///a', 'file:///b'] });
+        expect(ack.params?.notifications).toEqual({ resourceSubscriptions: ['file:///a', 'file:///b'] });
+        await h.close();
+    });
+
+    it('lifecycle SEP §3.4 rule 5: open-time throwing authorize counts as unavailable and keeps the entry', async () => {
+        const h = handler({
+            authorize: (_auth, target) => {
+                if (target.kind === 'resource' && target.uri === 'file:///b') throw new Error('acl offline');
+                return 'allow';
+            }
+        });
+        const { ack } = await open(h, 1, { resourceSubscriptions: ['file:///a', 'file:///b'] });
+        expect(ack.params?.notifications).toEqual({ resourceSubscriptions: ['file:///a', 'file:///b'] });
         await h.close();
     });
 
@@ -447,6 +900,16 @@ describe('reviewed defect regressions', () => {
         await h.close();
     });
 
+    it('defect 1: requested expiresAt beyond 2^31-1ms does not complete immediately', async () => {
+        const h = handler();
+        const { stream } = await open(h, 1, { resourceSubscriptions: ['file:///a'] }, auth(clock + 60 * 24 * 60 * 60 * 1000), {
+            expiresAt: iso(clock + 30 * 24 * 60 * 60 * 1000)
+        });
+        await advance(5);
+        await stream.expectNoMessage();
+        await h.close();
+    });
+
     it('defect 2: async delivery re-checks after authorize and does not write after a deadline closes the stream', async () => {
         const pending = new Deferred<AccessDecision>();
         let calls = 0;
@@ -460,6 +923,72 @@ describe('reviewed defect regressions', () => {
         await h.close();
     });
 
+    it('defect 2 and 7: event that first notices a passed deadline is held while pausing and delivered after update', async () => {
+        const h = handler({ reminderLeadsMs: () => [] });
+        const { stream, ack } = await open(h, 1, { resourceSubscriptions: ['file:///a'], lifecycle: true }, auth(clock + 1_000));
+        clock += 1_001;
+        h.notify.resourceUpdated('file:///a');
+        expect(await stream.next()).toMatchObject({
+            method: 'notifications/subscriptions/lifecycle',
+            params: { type: 'reauthorization_required' }
+        });
+        await h.fetch(updateRequest(2, ack.params?.handle as string), { authInfo: auth(clock + 60_000) });
+        await Promise.resolve();
+        expect(await stream.next()).toMatchObject({ method: 'notifications/resources/updated', params: { uri: 'file:///a' } });
+        await h.close();
+    });
+
+    it('defect 3: updating a paused stream schedules reminders before the new deadline and pauses again', async () => {
+        const h = handler({ reminderLeadsMs: () => [500] });
+        const { stream, ack } = await open(h, 1, { resourceSubscriptions: ['file:///a'], lifecycle: true }, auth(clock + 1_000));
+        await advance(1_000);
+        await stream.next();
+        await stream.next();
+        await h.fetch(updateRequest(2, ack.params?.handle as string), { authInfo: auth(clock + 2_000) });
+        await advance(1_500);
+        expect(await stream.next()).toMatchObject({
+            method: 'notifications/subscriptions/lifecycle',
+            params: { type: 'reauthorization_required' }
+        });
+        await advance(500);
+        expect(await stream.next()).toMatchObject({
+            method: 'notifications/subscriptions/lifecycle',
+            params: { type: 'reauthorization_required' }
+        });
+        expect(h.subscriptions.list()[0]?.state).toBe('paused');
+        await h.close();
+    });
+
+    it('defect 4: requireScopes does not restart maxAuthorizationLifetimeMs for streams that already satisfy the scope', async () => {
+        const h = handler({ maxAuthorizationLifetimeMs: 1_000 });
+        const { stream } = await open(h, 1, { resourceSubscriptions: ['file:///a'] }, auth(undefined, ['read']));
+        const before = h.subscriptions.list()[0]!;
+        await advance(100);
+        h.subscriptions.requireScopes(['read'], clock + 10_000);
+        expect(h.subscriptions.list()[0]?.authorizedUntil).toBe(before.authorizedUntil);
+        expect(h.subscriptions.list()[0]?.lastUpdatedAt).toBe(before.lastUpdatedAt);
+        await advance(900);
+        h.notify.resourceUpdated('file:///a');
+        expect(await stream.next()).toMatchObject({ error: { code: -32_023, data: { reason: 'token_expiry' } } });
+        await h.close();
+    });
+
+    it('defect 5: update idempotency includes token when tokens lack exp under a max authorization cap', async () => {
+        const h = handler({ maxAuthorizationLifetimeMs: 10_000 });
+        const { ack } = await open(h, 1, { resourceSubscriptions: ['file:///a'], lifecycle: true }, { ...auth(undefined), token: 'old' });
+        await advance(1_000);
+        const first = await json(
+            await h.fetch(updateRequest(2, ack.params?.handle as string), { authInfo: { ...auth(undefined), token: 'new-1' } })
+        );
+        await advance(1_000);
+        const second = await json(
+            await h.fetch(updateRequest(3, ack.params?.handle as string), { authInfo: { ...auth(undefined), token: 'new-2' } })
+        );
+        expect(second.result?.authorizedUntil).not.toBe(first.result?.authorizedUntil);
+        expect(second.result?.authorizedUntil).toBe(iso(clock + 10_000));
+        await h.close();
+    });
+
     it('defect 6: last-entry removal discovered on a change ends with revoked only at the deadline', async () => {
         let deny = false;
         const h = lifetimeHandler({ authorize: () => (deny ? 'deny' : 'allow') });
@@ -469,6 +998,72 @@ describe('reviewed defect regressions', () => {
         await stream.expectNoMessage();
         await advance(1_000);
         expect(await stream.next()).toMatchObject({ error: { code: -32_023, data: { reason: 'revoked' } } });
+        await h.close();
+    });
+
+    it('defect 8: update treats throwing authorize as unavailable and does not return 500 or remove entries', async () => {
+        const h = handler({
+            authorize: () => {
+                throw new Error('acl down');
+            }
+        });
+        const { ack } = await open(h, 1, { resourceSubscriptions: ['file:///a'], lifecycle: true });
+        const response = await h.fetch(updateRequest(2, ack.params?.handle as string, { expiresAt: iso(clock + 30_000) }), {
+            authInfo: auth(clock + 60_000)
+        });
+        expect(response.status).toBe(200);
+        expect(await json(response)).toMatchObject({ result: { expiresAt: iso(clock + 30_000) } });
+        expect(h.subscriptions.list()[0]?.acknowledged.resourceSubscriptions).toEqual(['file:///a']);
+        await h.close();
+    });
+
+    it('defect 8: queued update re-checks ended state after awaits and reports unknown handle after revoke', async () => {
+        const pending = new Deferred<AccessDecision>();
+        let calls = 0;
+        const h = handler({ authorize: () => (++calls === 1 ? 'allow' : pending.promise) });
+        const { ack } = await open(h, 1, { resourceSubscriptions: ['file:///a'], lifecycle: true });
+        const updatePromise = h.fetch(updateRequest(2, ack.params?.handle as string), { authInfo: auth(clock + 60_000) });
+        h.subscriptions.revoke();
+        pending.resolve('allow');
+        expect(await json(await updatePromise)).toMatchObject({ error: { code: -32_602, message: 'Unknown subscription handle' } });
+        await h.close();
+    });
+
+    it('defect 9: recheckAccess sends one access_reduced notification for multiple removed entries', async () => {
+        let deny = false;
+        const h = handler({ authorize: (_auth, target) => (target.kind === 'resource' && deny ? 'deny' : 'allow') });
+        const { stream } = await open(h, 1, { resourceSubscriptions: ['file:///a', 'file:///b'], lifecycle: true });
+        deny = true;
+        await h.subscriptions.recheckAccess();
+        expect(await stream.next()).toMatchObject({
+            method: 'notifications/subscriptions/lifecycle',
+            params: { type: 'access_reduced', removed: { resourceSubscriptions: ['file:///a', 'file:///b'] } }
+        });
+        expect(await stream.next()).toMatchObject({ error: { code: -32_023, data: { reason: 'revoked' } } });
+        await h.close();
+    });
+
+    it('defect 10: subscriptions/update is not refused when access checks are unavailable', async () => {
+        const h = handler({ authorize: () => 'unavailable' });
+        const { ack } = await open(h, 1, { resourceSubscriptions: ['file:///a'], lifecycle: true });
+        const response = await h.fetch(updateRequest(2, ack.params?.handle as string), { authInfo: auth(clock + 60_000) });
+        expect(response.status).toBe(200);
+        expect(await json(response)).toMatchObject({ result: { authorizedUntil: iso(clock + 60_000) } });
+        await h.close();
+    });
+
+    it('defect 11: no handle is issued when the authorization deadline is unknown', async () => {
+        const h = handler();
+        const { ack } = await open(h, 1, { resourceSubscriptions: ['file:///a'], lifecycle: true }, auth(undefined));
+        expect(ack.params).not.toHaveProperty('handle');
+        await h.close();
+    });
+
+    it('defect 12: no handle is issued when the token lacks a subject', async () => {
+        const h = handler();
+        const noSubject: AuthInfo = { token: 't', clientId: 'client-a', scopes: ['read'], expiresAt: (clock + 60_000) / 1000 };
+        const { ack } = await open(h, 1, { resourceSubscriptions: ['file:///a'], lifecycle: true }, noSubject);
+        expect(ack.params).not.toHaveProperty('handle');
         await h.close();
     });
 
@@ -490,6 +1085,71 @@ describe('reviewed defect regressions', () => {
         clock += 1_001;
         h.notify.resourceUpdated('file:///a');
         expect(await stream.next()).toBeUndefined();
+        await h.close();
+    });
+
+    it('lifecycle SEP §4 rule 5 and §3.3 rule 3: resumed stream delivers past the old expiry, reminds before the new deadline, and pauses again', async () => {
+        const h = handler({ reminderLeadsMs: () => [500] });
+        const { stream, ack } = await open(h, 1, { resourceSubscriptions: ['file:///a'], lifecycle: true }, auth(clock + 1_000));
+        await advance(1_000);
+        await stream.next();
+        await stream.next();
+        await h.fetch(updateRequest(2, ack.params?.handle as string), { authInfo: auth(clock + 2_000) });
+        h.notify.resourceUpdated('file:///a');
+        expect(await stream.next()).toMatchObject({ method: 'notifications/resources/updated', params: { uri: 'file:///a' } });
+        await advance(1_500);
+        expect(await stream.next()).toMatchObject({
+            method: 'notifications/subscriptions/lifecycle',
+            params: { type: 'reauthorization_required' }
+        });
+        await advance(500);
+        expect(await stream.next()).toMatchObject({
+            method: 'notifications/subscriptions/lifecycle',
+            params: { type: 'reauthorization_required' }
+        });
+        expect(h.subscriptions.list()[0]?.state).toBe('paused');
+        await h.close();
+    });
+
+    it('lifecycle SEP §3.4 rule 1: other resources keep delivering after one lifecycle entry is removed', async () => {
+        let denyB = false;
+        const h = handler({
+            authorize: (_auth, target) => (target.kind === 'resource' && target.uri === 'file:///b' && denyB ? 'deny' : 'allow')
+        });
+        const { stream } = await open(h, 1, { resourceSubscriptions: ['file:///a', 'file:///b'], lifecycle: true }, auth(clock + 1_000));
+        denyB = true;
+        await h.subscriptions.recheckAccess();
+        expect(await stream.next()).toMatchObject({ method: 'notifications/subscriptions/lifecycle', params: { type: 'access_reduced' } });
+        h.notify.resourceUpdated('file:///a');
+        expect(await stream.next()).toMatchObject({ method: 'notifications/resources/updated', params: { uri: 'file:///a' } });
+        await h.close();
+    });
+
+    it('async authorize promises are awaited during recheckAccess', async () => {
+        const pending = new Deferred<AccessDecision>();
+        let calls = 0;
+        const h = handler({ authorize: () => (++calls === 1 ? 'allow' : pending.promise) });
+        const { stream } = await open(h, 1, { resourceSubscriptions: ['file:///a'], lifecycle: true });
+        const recheck = h.subscriptions.recheckAccess();
+        await stream.expectNoMessage();
+        pending.resolve('deny');
+        await recheck;
+        expect(await stream.next()).toMatchObject({ method: 'notifications/subscriptions/lifecycle', params: { type: 'access_reduced' } });
+        await h.close();
+    });
+
+    it('async authorize promises are awaited during held replay', async () => {
+        const replay = new Deferred<AccessDecision>();
+        let authorizeCalls = 0;
+        const h = handler({ reminderLeadsMs: () => [], authorize: () => (++authorizeCalls >= 3 ? replay.promise : 'allow') });
+        const { stream, ack } = await open(h, 1, { resourceSubscriptions: ['file:///a'], lifecycle: true }, auth(clock + 1_000));
+        await advance(1_000);
+        await stream.next();
+        h.notify.resourceUpdated('file:///a');
+        await h.fetch(updateRequest(2, ack.params?.handle as string), { authInfo: auth(clock + 60_000) });
+        await stream.expectNoMessage();
+        replay.resolve('allow');
+        expect(await stream.next()).toMatchObject({ method: 'notifications/resources/updated', params: { uri: 'file:///a' } });
         await h.close();
     });
 });

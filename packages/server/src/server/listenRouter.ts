@@ -59,6 +59,8 @@ export interface ListenRouterOptions {
     onerror?: (error: Error) => void;
     /** Prototype draft vocabulary: the Authorization Lifetime SEP. */
     subscriptionLifetime?: SubscriptionLifetimeOptions;
+    /** Prototype draft vocabulary: the Subscription Lifecycle SEP. Requires `subscriptionLifetime`. */
+    subscriptionLifecycle?: SubscriptionLifecycleOptions;
 }
 
 /** The information a notification reveals for an authorization decision. */
@@ -74,16 +76,39 @@ export interface SubscriptionLifetimeOptions {
     /** Test seam for the current epoch time in milliseconds. */
     now?: () => number;
 }
+/**
+ * Server-side options for the prototype Subscription Lifecycle SEP, which builds on the lifetime SEP.
+ * Without them the server implements the lifetime SEP alone.
+ */
+export interface SubscriptionLifecycleOptions {
+    /** Lifecycle SEP §2 maximum stream lifetime. Undefined means no maximum. */
+    maxStreamLifetimeMs?: number;
+    /** Lifecycle SEP §4 handle issuance and `subscriptions/update`. Defaults to true. */
+    inPlaceUpdates?: boolean;
+    /** Lifecycle SEP §5 pause streams with lifecycle and handle at the deadline. Defaults to true. */
+    pause?: boolean;
+    /** Lifecycle SEP §5 rule 4 held notification policy. Defaults to `{ maxNotifications: 100 }`. */
+    hold?: { maxNotifications: number } | false;
+    /** Lifecycle SEP §3.3 reminder lead schedule. */
+    reminderLeadsMs?: (authorizationLifetimeMs: number) => number[];
+    /** Lifecycle SEP §5 rule 2 reminder interval while paused. Defaults to 60000. */
+    pausedReminderIntervalMs?: number;
+    /** Test seam for first-reminder jitter. */
+    random?: () => number;
+}
 /** Public stream state exposed by {@linkcode SubscriptionControl.list}. */
 export interface StreamInfo {
     subscriptionId: RequestId;
+    handle?: string;
     clientId?: string;
     subject?: string;
-    state: 'running';
+    state: 'running' | 'paused';
     acknowledged: SubscriptionFilter;
     authorizedUntil?: string;
+    expiresAt?: string;
+    lastUpdatedAt?: string;
 }
-/** Prototype server control API for subscription lifetime signals. */
+/** Prototype server control API for subscription lifetime/lifecycle signals. */
 export interface SubscriptionControl {
     revoke(match?: (s: StreamInfo) => boolean): number;
     recheckAccess(match?: (s: StreamInfo) => boolean): Promise<void>;
@@ -100,8 +125,15 @@ export interface NotificationBody {
     params: { _meta?: Record<string, unknown>; [key: string]: unknown };
 }
 
-function jsonRpcError(id: RequestId | null, code: number, message: string, data?: unknown, status = 200): Response {
-    return Response.json({ jsonrpc: '2.0', error: { code, message, ...(data !== undefined && { data }) }, id }, { status });
+function jsonRpcError(
+    id: RequestId | null,
+    code: number,
+    message: string,
+    data?: unknown,
+    status = 200,
+    headers?: Record<string, string>
+): Response {
+    return Response.json({ jsonrpc: '2.0', error: { code, message, ...(data !== undefined && { data }) }, id }, { status, headers });
 }
 
 /** Stamp the subscription id onto a notification's `_meta`. Non-mutating. */
@@ -155,6 +187,8 @@ export interface ListenRouter {
         serverInfo: Implementation,
         authInfo: AuthInfo | undefined
     ): Promise<Response>;
+    /** Serve one entry-handled prototype `subscriptions/update` request. */
+    update(message: JSONRPCRequest, authInfo: AuthInfo | undefined): Promise<Response>;
     /**
      * Gracefully close every open subscription stream: emits the empty
      * `subscriptions/listen` JSON-RPC result (the spec's graceful-close
@@ -173,6 +207,11 @@ function iso(ms: number): string {
 function subjectOf(authInfo: AuthInfo | undefined): string | undefined {
     const sub = authInfo?.extra?.['sub'];
     return typeof sub === 'string' ? sub : undefined;
+}
+function parseTime(value: unknown): number | undefined {
+    if (typeof value !== 'string') return undefined;
+    const ms = Date.parse(value);
+    return Number.isFinite(ms) ? ms : undefined;
 }
 function hasEntries(filter: SubscriptionFilter): boolean {
     return (
@@ -281,6 +320,18 @@ function removeTarget(filter: SubscriptionFilter, target: AccessTarget): Subscri
     }
     return next;
 }
+function defaultReminderLeads(lifetimeMs: number): number[] {
+    return lifetimeMs >= 600_000
+        ? [60_000, 30_000, 15_000, 10_000, 5000]
+        : [0.1, 0.05, 0.03, 0.02, 0.01].map(f => Math.max(1, Math.floor(lifetimeMs * f)));
+}
+function makeHandle(): string {
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    let binary = '';
+    for (const byte of bytes) binary += String.fromCodePoint(byte);
+    return `sub_${btoa(binary).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '')}`;
+}
 
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
@@ -292,35 +343,58 @@ interface Requirement {
 const requirementMet = (authInfo: AuthInfo | undefined, req?: Requirement): boolean =>
     req === undefined || req.scopes.every(scope => authInfo?.scopes.includes(scope));
 
+function noEntryPermitted(decisions: Map<AccessTarget, AccessDecision>): boolean {
+    return decisions.size > 0 && [...decisions.values()].every(decision => decision === 'deny');
+}
+
 interface StreamState {
     id: RequestId;
+    handle?: string;
     authInfo?: AuthInfo;
     subject?: string;
     clientId?: string;
     draft: boolean;
+    lifecycle: boolean;
     acknowledged: SubscriptionFilter;
+    expiresAt?: number;
     authorizationDeadline?: number;
     deadlineReason: 'token_expiry' | 'insufficient_authorization';
     authorizedAtMs: number;
-    state: 'running' | 'ended';
+    lastUpdatedAt: number;
+    state: 'running' | 'paused' | 'ended';
     requirement?: Requirement;
     pendingRemoved: SubscriptionFilter;
+    dropped: boolean;
+    held: ServerEvent[];
     controller: ReadableStreamDefaultController<Uint8Array>;
     unsubscribe?: () => void;
     keepAliveTimer?: ReturnType<typeof setInterval>;
     timers: ReturnType<typeof setTimeout>[];
     abortCleanup?: () => void;
+    updateQueue: Promise<void>;
     writeFrame(frame: string): void;
     close(graceful: boolean): void;
+    lastUpdateKey?: string;
+    lastUpdateResult?: { resultType: 'complete'; expiresAt?: string; authorizedUntil: string; lastUpdatedAt: string };
 }
 
 export function createListenRouter(options: ListenRouterOptions): ListenRouter {
     const { bus, onerror } = options;
     const lifetime = options.subscriptionLifetime;
+    const lifecycle = options.subscriptionLifecycle;
+    if (lifecycle !== undefined && lifetime === undefined) {
+        throw new TypeError('subscriptionLifecycle requires subscriptionLifetime: the lifecycle SEP builds on the lifetime SEP');
+    }
     const maxSubscriptions = options.maxSubscriptions ?? DEFAULT_MAX_SUBSCRIPTIONS;
     const keepAliveMs = options.keepAliveMs ?? DEFAULT_SSE_KEEP_ALIVE_MS;
     const now = () => lifetime?.now?.() ?? Date.now();
+    const random = () => lifecycle?.random?.() ?? Math.random();
+    const lifecycleEnabled = lifecycle !== undefined;
+    const inPlaceUpdates = lifecycleEnabled && (lifecycle?.inPlaceUpdates ?? true);
+    const pauseEnabled = lifecycle?.pause ?? true;
+    const holdConfig = lifecycle?.hold === undefined ? { maxNotifications: 100 } : lifecycle.hold;
     const open = new Set<StreamState>();
+    const byHandle = new Map<string, StreamState>();
 
     const report = (error: unknown): void => onerror?.(error instanceof Error ? error : new Error(String(error)));
 
@@ -335,19 +409,30 @@ export function createListenRouter(options: ListenRouterOptions): ListenRouter {
 
     const infoOf = (s: StreamState): StreamInfo => ({
         subscriptionId: s.id,
+        ...(s.handle !== undefined && { handle: s.handle }),
         ...(s.clientId !== undefined && { clientId: s.clientId }),
         ...(s.subject !== undefined && { subject: s.subject }),
-        state: 'running',
+        state: s.state === 'paused' ? 'paused' : 'running',
         acknowledged: {
             ...s.acknowledged,
             ...(s.acknowledged.resourceSubscriptions !== undefined && { resourceSubscriptions: [...s.acknowledged.resourceSubscriptions] })
         },
-        ...(s.authorizationDeadline !== undefined && { authorizedUntil: iso(s.authorizationDeadline) })
+        ...(s.authorizationDeadline !== undefined && { authorizedUntil: iso(s.authorizationDeadline) }),
+        ...(s.expiresAt !== undefined && { expiresAt: iso(s.expiresAt) }),
+        ...(lifecycleEnabled && { lastUpdatedAt: iso(s.lastUpdatedAt) })
     });
+
+    const bump = (s: StreamState): void => {
+        s.lastUpdatedAt = Math.max(now(), s.lastUpdatedAt + 1);
+    };
 
     const writeJson = (s: StreamState, message: unknown): void => s.writeFrame(`event: message\ndata: ${JSON.stringify(message)}\n\n`);
     const writeNotification = (s: StreamState, method: string, params: Record<string, unknown>): void =>
         writeJson(s, { jsonrpc: '2.0', method, params });
+    const stamped = (s: StreamState, params: Record<string, unknown>): Record<string, unknown> => ({
+        ...params,
+        _meta: { ...(params['_meta'] as Record<string, unknown> | undefined), [SUBSCRIPTION_ID_META_KEY]: s.id }
+    });
 
     const recomputeDeadline = (s: StreamState): void => {
         const candidates: { at: number; reason: 'token_expiry' | 'insufficient_authorization' }[] = [];
@@ -396,26 +481,95 @@ export function createListenRouter(options: ListenRouterOptions): ListenRouter {
         s.close(false);
     }
 
+    const holdOrDrop = (s: StreamState, event: ServerEvent): void => {
+        if (holdConfig !== false && s.held.length < holdConfig.maxNotifications) s.held.push(event);
+        else s.dropped = true;
+    };
+
     const flushRemoved = (s: StreamState): void => {
         if (!hasEntries(s.pendingRemoved)) return;
+        const removed = s.pendingRemoved;
         s.pendingRemoved = {};
+        bump(s);
+        if (s.lifecycle) {
+            writeNotification(
+                s,
+                'notifications/subscriptions/lifecycle',
+                stamped(s, { type: 'access_reduced', removed, lastUpdatedAt: iso(s.lastUpdatedAt) })
+            );
+        }
         if (!hasEntries(s.acknowledged)) endAuthorization(s, 'revoked');
+    };
+
+    const sendReminder = (s: StreamState): void => {
+        if (s.state === 'ended' || !s.lifecycle || s.authorizationDeadline === undefined) return;
+        flushRemoved(s);
+        if ((s as StreamState).state === 'ended') return;
+        writeNotification(
+            s,
+            'notifications/subscriptions/lifecycle',
+            stamped(s, {
+                type: 'reauthorization_required',
+                authorizedUntil: iso(s.authorizationDeadline),
+                reason: s.deadlineReason,
+                lastUpdatedAt: iso(s.lastUpdatedAt)
+            })
+        );
+    };
+
+    const sendMissed = (s: StreamState): void => {
+        if (s.lifecycle && s.dropped) {
+            s.dropped = false;
+            writeNotification(
+                s,
+                'notifications/subscriptions/lifecycle',
+                stamped(s, { type: 'missed', lastUpdatedAt: iso(s.lastUpdatedAt) })
+            );
+        }
     };
 
     const onDeadline = (s: StreamState): void => {
         if (s.state === 'ended') return;
+        if (s.expiresAt !== undefined && now() >= s.expiresAt) {
+            s.close(true);
+            return;
+        }
         if (!hasEntries(s.acknowledged)) {
             endAuthorization(s, 'revoked');
             return;
         }
-        endAuthorization(s, s.deadlineReason);
+        if (s.lifecycle && s.handle !== undefined && pauseEnabled) {
+            s.state = 'paused';
+            sendReminder(s);
+            schedule(s);
+        } else {
+            endAuthorization(s, s.deadlineReason);
+        }
     };
 
     function schedule(s: StreamState): void {
         clearTimers(s);
         if (s.state === 'ended') return;
-        if (s.authorizationDeadline === undefined) return;
+        if (s.expiresAt !== undefined) armAt(s, s.expiresAt, () => s.close(true));
+        if (s.authorizationDeadline === undefined || (s.expiresAt !== undefined && s.expiresAt <= s.authorizationDeadline)) return;
+        if (s.state === 'paused') {
+            armAt(s, now() + Math.max(60_000, lifecycle?.pausedReminderIntervalMs ?? 60_000), () => {
+                sendReminder(s);
+                schedule(s);
+            });
+            return;
+        }
         armAt(s, s.authorizationDeadline, () => onDeadline(s));
+        if (s.lifecycle) {
+            const lifetimeMs = Math.max(1, s.authorizationDeadline - s.authorizedAtMs);
+            for (const [index, lead] of (lifecycle?.reminderLeadsMs?.(lifetimeMs) ?? defaultReminderLeads(lifetimeMs))
+                .filter(x => x > 0)
+                .toSorted((a, b) => b - a)
+                .entries()) {
+                const due = s.authorizationDeadline - lead - (index === 0 ? random() * 0.1 * lead : 0);
+                if (due > now()) armAt(s, due, () => sendReminder(s));
+            }
+        }
     }
 
     const removeEntry = (s: StreamState, target: AccessTarget): void => {
@@ -434,9 +588,24 @@ export function createListenRouter(options: ListenRouterOptions): ListenRouter {
 
     const blockData = (s: StreamState, event: ServerEvent): void => {
         if (s.state === 'ended' || !listenFilterAccepts(s.acknowledged, event)) return;
-        if (s.authorizationDeadline !== undefined && now() >= s.authorizationDeadline) {
-            endAuthorization(s, hasEntries(s.acknowledged) ? s.deadlineReason : 'revoked');
+        if (s.state === 'paused') {
+            holdOrDrop(s, event);
+            return;
         }
+        if (s.authorizationDeadline !== undefined && now() >= s.authorizationDeadline) {
+            if (s.expiresAt !== undefined && now() >= s.expiresAt) {
+                s.close(true);
+            } else if (s.lifecycle && s.handle !== undefined && pauseEnabled) {
+                s.state = 'paused';
+                sendReminder(s);
+                schedule(s);
+                holdOrDrop(s, event);
+            } else {
+                endAuthorization(s, hasEntries(s.acknowledged) ? s.deadlineReason : 'revoked');
+            }
+            return;
+        }
+        holdOrDrop(s, event);
     };
 
     const deliver = async (s: StreamState, event: ServerEvent): Promise<void> => {
@@ -451,13 +620,36 @@ export function createListenRouter(options: ListenRouterOptions): ListenRouter {
             removeEntry(s, target);
             return;
         }
-        if (decision === 'unavailable') return;
+        if (decision === 'unavailable') {
+            s.dropped = true;
+            sendMissed(s);
+            return;
+        }
         if (!canWriteData(s, event)) {
             blockData(s, event);
             return;
         }
         const note = stampSubscriptionId(serverEventToNotification(event), s.id);
         writeNotification(s, note.method, note.params);
+    };
+
+    const validateExpiry = (
+        value: unknown,
+        id: RequestId,
+        allowNull: boolean
+    ): { ok: true; value?: number } | { ok: false; response: Response } => {
+        if (value === undefined || (value === null && allowNull)) return { ok: true };
+        const parsed = parseTime(value);
+        if (parsed === undefined || parsed <= now()) return { ok: false, response: jsonRpcError(id, -32_602, 'Invalid expiresAt') };
+        if (lifecycle?.maxStreamLifetimeMs !== undefined && parsed > now() + lifecycle.maxStreamLifetimeMs) {
+            return {
+                ok: false,
+                response: jsonRpcError(id, -32_602, 'expiresAt is later than this server allows', {
+                    maxExpiresAt: iso(now() + lifecycle.maxStreamLifetimeMs)
+                })
+            };
+        }
+        return { ok: true, value: parsed };
     };
 
     async function decisionsFor(filter: SubscriptionFilter, authInfo: AuthInfo | undefined): Promise<Map<AccessTarget, AccessDecision>> {
@@ -479,6 +671,15 @@ export function createListenRouter(options: ListenRouterOptions): ListenRouter {
         if (announce) flushRemoved(s);
     }
 
+    function makeResult(s: StreamState): { resultType: 'complete'; expiresAt?: string; authorizedUntil: string; lastUpdatedAt: string } {
+        return {
+            resultType: 'complete',
+            ...(s.expiresAt !== undefined && { expiresAt: iso(s.expiresAt) }),
+            authorizedUntil: iso(s.authorizationDeadline!),
+            lastUpdatedAt: iso(s.lastUpdatedAt)
+        };
+    }
+
     async function serve(
         message: JSONRPCRequest,
         signal: AbortSignal | undefined,
@@ -490,8 +691,11 @@ export function createListenRouter(options: ListenRouterOptions): ListenRouter {
         const filter = parseListenFilter(message);
         if (filter === undefined)
             return jsonRpcError(message.id, -32_602, "Invalid params: 'notifications' is required and must be a valid SubscriptionFilter");
-        const params = message.params as { _meta?: Record<string, unknown> } | undefined;
+        const params = message.params as { expiresAt?: unknown; _meta?: Record<string, unknown> } | undefined;
+        const expiry = lifecycleEnabled ? validateExpiry(params?.expiresAt, message.id, false) : { ok: true as const, value: undefined };
+        if (!expiry.ok) return expiry.response;
         const honored = honoredSubset(filter, capabilities);
+        if (filter.lifecycle === true && lifecycleEnabled) honored.lifecycle = true;
         if (lifetime?.authorize !== undefined) {
             const decisions = await decisionsFor(honored, authInfo);
             const denied = [...decisions].filter(([, decision]) => decision === 'deny').map(([target]) => target);
@@ -504,6 +708,8 @@ export function createListenRouter(options: ListenRouterOptions): ListenRouter {
         const encoder = new TextEncoder();
         const caps = params?._meta?.[CLIENT_CAPABILITIES_META_KEY] as ClientCapabilities | undefined;
         const draft = typeof caps?.experimental?.['io.modelcontextprotocol/subscription-lifetime'] === 'object';
+        const initialExpiry =
+            expiry.value ?? (lifecycle?.maxStreamLifetimeMs === undefined ? undefined : now() + lifecycle.maxStreamLifetimeMs);
 
         const readable = new ReadableStream<Uint8Array>({
             start(c) {
@@ -514,13 +720,19 @@ export function createListenRouter(options: ListenRouterOptions): ListenRouter {
                     subject: subjectOf(authInfo),
                     clientId: authInfo?.clientId,
                     draft,
+                    lifecycle: honored.lifecycle === true,
                     acknowledged: honored,
+                    ...(initialExpiry !== undefined && { expiresAt: initialExpiry }),
                     deadlineReason: 'token_expiry',
                     authorizedAtMs: now(),
+                    lastUpdatedAt: now(),
                     state: 'running',
                     pendingRemoved: {},
+                    dropped: false,
+                    held: [],
                     controller,
                     timers: [],
+                    updateQueue: Promise.resolve(),
                     writeFrame(frame) {
                         if (this.state !== 'ended') {
                             try {
@@ -552,6 +764,7 @@ export function createListenRouter(options: ListenRouterOptions): ListenRouter {
                         clearTimers(this);
                         this.abortCleanup?.();
                         open.delete(this);
+                        if (this.handle !== undefined) byHandle.delete(this.handle);
                         try {
                             controller.close();
                         } catch {
@@ -560,8 +773,19 @@ export function createListenRouter(options: ListenRouterOptions): ListenRouter {
                     }
                 };
                 recomputeDeadline(state);
+                if (
+                    inPlaceUpdates &&
+                    state.authorizationDeadline !== undefined &&
+                    state.clientId !== undefined &&
+                    state.subject !== undefined
+                ) {
+                    state.handle = makeHandle();
+                }
                 const ackParams: Record<string, unknown> = { notifications: honored };
                 if (state.authorizationDeadline !== undefined) ackParams['authorizedUntil'] = iso(state.authorizationDeadline);
+                if (lifecycleEnabled && state.expiresAt !== undefined) ackParams['expiresAt'] = iso(state.expiresAt);
+                if (lifecycleEnabled) ackParams['lastUpdatedAt'] = iso(state.lastUpdatedAt);
+                if (state.handle !== undefined) ackParams['handle'] = state.handle;
                 const ack = stampSubscriptionId({ method: 'notifications/subscriptions/acknowledged', params: ackParams }, id);
                 writeNotification(state, ack.method, ack.params);
                 if (!hasEntries(honored)) {
@@ -573,6 +797,7 @@ export function createListenRouter(options: ListenRouterOptions): ListenRouter {
                 });
                 state.keepAliveTimer = armSseKeepAlive(keepAliveMs, () => state.writeFrame(': keepalive\n\n'));
                 open.add(state);
+                if (state.handle !== undefined) byHandle.set(state.handle, state);
                 schedule(state);
             },
             cancel() {
@@ -600,6 +825,84 @@ export function createListenRouter(options: ListenRouterOptions): ListenRouter {
         });
     }
 
+    async function performUpdate(s: StreamState, message: JSONRPCRequest, authInfo: AuthInfo | undefined): Promise<Response> {
+        if (s.state === 'ended') return jsonRpcError(message.id, -32_602, 'Unknown subscription handle');
+        const params = (message.params ?? {}) as Record<string, unknown>;
+        const unsupported = Object.keys(params).filter(k => !['handle', 'expiresAt', '_meta'].includes(k));
+        if (unsupported.length > 0)
+            return jsonRpcError(message.id, -32_602, 'Unsupported subscription update field', { unsupportedFields: unsupported });
+        if (s.requirement !== undefined && !requirementMet(authInfo, s.requirement)) {
+            return jsonRpcError(message.id, -32_000, 'Insufficient scope', undefined, 403, {
+                'WWW-Authenticate': `Bearer error="insufficient_scope", scope="${[
+                    ...new Set([...(authInfo?.scopes ?? []), ...s.requirement.scopes])
+                ].join(' ')}"`
+            });
+        }
+        const expiry = validateExpiry(params['expiresAt'], message.id, true);
+        if (!expiry.ok) return expiry.response;
+
+        const decisions = await decisionsFor(s.acknowledged, authInfo);
+        if ((s as StreamState).state === 'ended') return jsonRpcError(message.id, -32_602, 'Unknown subscription handle');
+        // Lifecycle SEP §4 rule 3: an update whose authorization permits none of the stream's entries is refused, naming them.
+        if (noEntryPermitted(decisions))
+            return jsonRpcError(message.id, -32_602, 'Not permitted', { denied: filterOf([...decisions.keys()]) });
+
+        const key = JSON.stringify({
+            token: authInfo?.token,
+            authInfo: {
+                clientId: authInfo?.clientId,
+                subject: subjectOf(authInfo),
+                scopes: authInfo?.scopes,
+                expiresAt: authInfo?.expiresAt
+            },
+            expiresAt: Object.hasOwn(params, 'expiresAt') ? params['expiresAt'] : '__omitted'
+        });
+        if (s.lastUpdateKey === key && s.lastUpdateResult !== undefined)
+            return Response.json({ jsonrpc: '2.0', id: message.id, result: s.lastUpdateResult });
+
+        s.authInfo = authInfo;
+        s.clientId = authInfo?.clientId;
+        s.subject = subjectOf(authInfo);
+        s.authorizedAtMs = now();
+        if (Object.hasOwn(params, 'expiresAt'))
+            s.expiresAt =
+                expiry.value ?? (lifecycle?.maxStreamLifetimeMs === undefined ? undefined : now() + lifecycle.maxStreamLifetimeMs);
+        applyDeniedDecisions(s, decisions);
+        bump(s);
+        recomputeDeadline(s);
+        s.state = 'running';
+        schedule(s);
+        const result = makeResult(s);
+        s.lastUpdateKey = key;
+        s.lastUpdateResult = result;
+        queueMicrotask(() => {
+            void (async () => {
+                flushRemoved(s);
+                const held = s.held.splice(0);
+                for (const event of held) await deliver(s, event);
+                sendMissed(s);
+            })().catch(report);
+        });
+        return Response.json({ jsonrpc: '2.0', id: message.id, result });
+    }
+
+    async function update(message: JSONRPCRequest, authInfo: AuthInfo | undefined): Promise<Response> {
+        const params = (message.params ?? {}) as Record<string, unknown>;
+        const handle = typeof params['handle'] === 'string' ? params['handle'] : undefined;
+        const s = handle === undefined ? undefined : byHandle.get(handle);
+        if (s === undefined || s.state === 'ended' || s.clientId !== authInfo?.clientId || s.subject !== subjectOf(authInfo))
+            return jsonRpcError(message.id, -32_602, 'Unknown subscription handle');
+        const run = s.updateQueue.then(
+            () => performUpdate(s, message, authInfo),
+            () => performUpdate(s, message, authInfo)
+        );
+        s.updateQueue = run.then(
+            () => {},
+            () => {}
+        );
+        return run;
+    }
+
     const control: SubscriptionControl = {
         revoke(match) {
             let count = 0;
@@ -621,6 +924,8 @@ export function createListenRouter(options: ListenRouterOptions): ListenRouter {
                 s.requirement = { scopes: [...scopes], effectiveAtMs };
                 recomputeDeadline(s);
                 if (s.authorizationDeadline !== old) {
+                    bump(s);
+                    if (s.authorizationDeadline !== undefined && (old === undefined || s.authorizationDeadline < old)) sendReminder(s);
                     schedule(s);
                 }
             }
@@ -629,6 +934,7 @@ export function createListenRouter(options: ListenRouterOptions): ListenRouter {
     };
     return {
         serve,
+        update,
         closeAll() {
             for (const s of open) s.close(true);
         },
