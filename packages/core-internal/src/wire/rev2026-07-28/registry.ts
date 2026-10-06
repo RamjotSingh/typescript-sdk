@@ -52,7 +52,9 @@ const requestMethodKeys: { readonly [M in Rev2026RequestMethod]: null } = {
     'resources/read': null,
     'completion/complete': null,
     'server/discover': null,
-    'subscriptions/listen': null
+    'subscriptions/listen': null,
+    // Prototype draft vocabulary: in-place subscription update.
+    'subscriptions/update': null
 };
 
 const notificationMethodKeys: { readonly [M in Rev2026NotificationMethod]: null } = {
@@ -63,7 +65,9 @@ const notificationMethodKeys: { readonly [M in Rev2026NotificationMethod]: null 
     'notifications/resources/list_changed': null,
     'notifications/tools/list_changed': null,
     'notifications/prompts/list_changed': null,
-    'notifications/subscriptions/acknowledged': null
+    'notifications/subscriptions/acknowledged': null,
+    // Prototype draft vocabulary: subscription lifecycle notifications.
+    'notifications/subscriptions/lifecycle': null
 };
 
 /** The 2026-era request-method set (registry membership = the deletion story). */

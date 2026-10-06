@@ -16,6 +16,7 @@ import type {
     PROTOCOL_VERSION_META_KEY
 } from './constants';
 import type {
+    AccessReducedLifecycleParamsSchema,
     AnnotationsSchema,
     AudioContentSchema,
     AuthorizationReasonSchema,
@@ -92,6 +93,7 @@ import type {
     LoggingLevelSchema,
     LoggingMessageNotificationParamsSchema,
     LoggingMessageNotificationSchema,
+    MissedLifecycleParamsSchema,
     ModelHintSchema,
     ModelPreferencesSchema,
     MultiSelectEnumSchemaSchema,
@@ -115,6 +117,7 @@ import type {
     ReadResourceRequestParamsSchema,
     ReadResourceRequestSchema,
     ReadResourceResultSchema,
+    ReauthorizationRequiredLifecycleParamsSchema,
     RelatedTaskMetadataSchema,
     RequestIdSchema,
     RequestMetaSchema,
@@ -147,12 +150,17 @@ import type {
     SubscribeRequestParamsSchema,
     SubscribeRequestSchema,
     SubscriptionFilterSchema,
+    SubscriptionLifecycleNotificationSchema,
+    SubscriptionLifecycleParamsBaseSchema,
     SubscriptionsAcknowledgedNotificationParamsSchema,
     SubscriptionsAcknowledgedNotificationSchema,
     SubscriptionsListenRequestParamsSchema,
     SubscriptionsListenRequestSchema,
     SubscriptionsListenResultMetaSchema,
     SubscriptionsListenResultSchema,
+    SubscriptionsUpdateRequestParamsSchema,
+    SubscriptionsUpdateRequestSchema,
+    SubscriptionsUpdateResultSchema,
     TaskAugmentedRequestParamsSchema,
     TaskCreationParamsSchema,
     TaskMetadataSchema,
@@ -386,6 +394,22 @@ export type SubscriptionsListenResultMeta = Infer<typeof SubscriptionsListenResu
 export type SubscriptionsListenResult = StripWireOnly<Infer<typeof SubscriptionsListenResultSchema>>;
 /** Prototype draft vocabulary: why a stream's authorization ended or needs attention. */
 export type AuthorizationReason = Infer<typeof AuthorizationReasonSchema>;
+/** Prototype draft vocabulary: common lifecycle notification params. */
+export type SubscriptionLifecycleParamsBase = Infer<typeof SubscriptionLifecycleParamsBaseSchema>;
+/** Prototype draft vocabulary: reauthorization reminder params. */
+export type ReauthorizationRequiredLifecycleParams = Infer<typeof ReauthorizationRequiredLifecycleParamsSchema>;
+/** Prototype draft vocabulary: access-reduced lifecycle params. */
+export type AccessReducedLifecycleParams = Infer<typeof AccessReducedLifecycleParamsSchema>;
+/** Prototype draft vocabulary: missed lifecycle params. */
+export type MissedLifecycleParams = Infer<typeof MissedLifecycleParamsSchema>;
+/** Prototype draft vocabulary: lifecycle notification. */
+export type SubscriptionLifecycleNotification = Infer<typeof SubscriptionLifecycleNotificationSchema>;
+/** Prototype draft vocabulary: `subscriptions/update` params. */
+export type SubscriptionsUpdateRequestParams = Infer<typeof SubscriptionsUpdateRequestParamsSchema>;
+/** Prototype draft vocabulary: `subscriptions/update` request. */
+export type SubscriptionsUpdateRequest = Infer<typeof SubscriptionsUpdateRequestSchema>;
+/** Prototype draft vocabulary: `subscriptions/update` result. */
+export type SubscriptionsUpdateResult = StripWireOnly<Infer<typeof SubscriptionsUpdateResultSchema>>;
 
 /* Prompts */
 export type PromptArgument = Infer<typeof PromptArgumentSchema>;
@@ -700,6 +724,8 @@ export type ResultTypeMap = {
     // never reach `request()` / the typed result map — `Client.listen()` sends
     // directly on the transport and demuxes the response in `_onresponse`.
     'subscriptions/listen': SubscriptionsListenResult;
+    /** Prototype draft vocabulary: in-place subscription update result. */
+    'subscriptions/update': SubscriptionsUpdateResult;
     'tools/call': CallToolResult;
     'tools/list': ListToolsResult;
     'sampling/createMessage': CreateMessageResult | CreateMessageResultWithTools;

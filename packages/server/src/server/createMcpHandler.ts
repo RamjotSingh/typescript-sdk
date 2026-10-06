@@ -60,7 +60,7 @@ import {
 } from '@modelcontextprotocol/core-internal';
 
 import { invoke } from './invoke';
-import type { SubscriptionControl, SubscriptionLifetimeOptions } from './listenRouter';
+import type { SubscriptionControl, SubscriptionLifecycleOptions, SubscriptionLifetimeOptions } from './listenRouter';
 import { createListenRouter, DEFAULT_MAX_SUBSCRIPTIONS } from './listenRouter';
 import { McpServer } from './mcp';
 import type { PerRequestResponseMode } from './perRequestTransport';
@@ -216,6 +216,11 @@ export interface CreateMcpHandlerOptions {
     maxRequestBodySize?: number;
     /** Prototype draft vocabulary: the Authorization Lifetime SEP for subscription streams. */
     subscriptionLifetime?: SubscriptionLifetimeOptions;
+    /**
+     * Prototype draft vocabulary: the Subscription Lifecycle SEP, which builds on the lifetime SEP.
+     * Requires `subscriptionLifetime`; without it, the server implements the lifetime SEP alone.
+     */
+    subscriptionLifecycle?: SubscriptionLifecycleOptions;
 }
 
 /**
@@ -709,7 +714,8 @@ export function createMcpHandler(factory: McpServerFactory, options: CreateMcpHa
         maxSubscriptions: options.maxSubscriptions ?? DEFAULT_MAX_SUBSCRIPTIONS,
         keepAliveMs: options.keepAliveMs ?? DEFAULT_SSE_KEEP_ALIVE_MS,
         onerror: reportError,
-        subscriptionLifetime: options.subscriptionLifetime
+        subscriptionLifetime: options.subscriptionLifetime,
+        subscriptionLifecycle: options.subscriptionLifecycle
     });
     if (responseMode === 'json') {
         // eslint-disable-next-line no-console
@@ -784,6 +790,14 @@ export function createMcpHandler(factory: McpServerFactory, options: CreateMcpHa
                     );
                 }
             }
+        }
+
+        if (
+            route.messageKind === 'request' &&
+            route.message.method === 'subscriptions/update' &&
+            options.subscriptionLifecycle !== undefined
+        ) {
+            return listenRouter.update(route.message, authInfo);
         }
 
         const product = await factory({

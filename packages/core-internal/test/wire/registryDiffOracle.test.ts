@@ -49,6 +49,15 @@ const SEED_EXCLUSIONS: Record<string, Record<string, string>> = {
     }
 };
 
+/** Registry-side prototype draft vocabulary deliberately absent from the pinned 2026-07-28 anchor. */
+const PROTOTYPE_DRAFT_ADDITIONS: Record<string, Record<string, string>> = {
+    '2025-11-25': {},
+    '2026-07-28': {
+        'subscriptions/update': 'Prototype draft vocabulary for the Subscription Lifecycle SEP.',
+        'notifications/subscriptions/lifecycle': 'Prototype draft vocabulary for the Subscription Lifecycle SEP.'
+    }
+};
+
 const REGISTRIES = {
     '2025-11-25': { requests: rev2025RequestMethods, notifications: rev2025NotificationMethods },
     '2026-07-28': { requests: rev2026RequestMethods, notifications: rev2026NotificationMethods }
@@ -58,6 +67,7 @@ describe.each(['2025-11-25', '2026-07-28'] as const)('registry-diff oracle %s', 
     const anchor = anchorMethods(revision);
     const registry = REGISTRIES[revision];
     const exclusions = SEED_EXCLUSIONS[revision]!;
+    const draftAdditions = PROTOTYPE_DRAFT_ADDITIONS[revision]!;
 
     test('every anchor method is in the hand registry or a documented seed exclusion', () => {
         const missing = [...anchor.requests, ...anchor.notifications].filter(method => {
@@ -73,8 +83,19 @@ describe.each(['2025-11-25', '2026-07-28'] as const)('registry-diff oracle %s', 
 
     test('the hand registry contains nothing beyond the anchor universe', () => {
         const anchorSet = new Set([...anchor.requests, ...anchor.notifications]);
-        const extra = [...registry.requests, ...registry.notifications].filter(method => !anchorSet.has(method));
+        const extra = [...registry.requests, ...registry.notifications].filter(
+            method => !anchorSet.has(method) && !(method in draftAdditions)
+        );
         expect(extra, `Registry methods with no ${revision} anchor literal — era leak or typo`).toEqual([]);
+    });
+
+    test('prototype draft additions are not stale (still absent from the anchor, still in the registry)', () => {
+        for (const [method, reason] of Object.entries(draftAdditions)) {
+            const inAnchor = anchor.requests.includes(method) || anchor.notifications.includes(method);
+            expect(inAnchor, `${method}: draft addition landed in the anchor — remove the prototype addition (${reason})`).toBe(false);
+            const inRegistry = registry.requests.includes(method) || registry.notifications.includes(method);
+            expect(inRegistry, `${method}: draft addition is no longer wired — remove the stale allowance (${reason})`).toBe(true);
+        }
     });
 
     test('seed exclusions are not stale (still in the anchor, still not in the registry)', () => {

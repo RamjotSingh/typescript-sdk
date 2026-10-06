@@ -59,7 +59,8 @@ export type Rev2026RequestMethod =
     | 'resources/read'
     | 'completion/complete'
     | 'server/discover'
-    | 'subscriptions/listen';
+    | 'subscriptions/listen'
+    | 'subscriptions/update';
 
 /** The 2026-era notification-method set (the hand-registry seed; see the deletion list above). */
 export type Rev2026NotificationMethod =
@@ -70,7 +71,8 @@ export type Rev2026NotificationMethod =
     | 'notifications/resources/list_changed'
     | 'notifications/tools/list_changed'
     | 'notifications/prompts/list_changed'
-    | 'notifications/subscriptions/acknowledged';
+    | 'notifications/subscriptions/acknowledged'
+    | 'notifications/subscriptions/lifecycle';
 
 function build() {
     /* ════════════════════════════════════════════════════════════════════════════
@@ -1064,10 +1066,22 @@ function build() {
         toolsListChanged: z.boolean().optional(),
         promptsListChanged: z.boolean().optional(),
         resourcesListChanged: z.boolean().optional(),
-        resourceSubscriptions: z.array(z.string()).optional()
+        resourceSubscriptions: z.array(z.string()).optional(),
+        // Prototype draft vocabulary: subscription lifecycle opt-in.
+        lifecycle: z.boolean().optional()
     });
-    const subscriptionsListenParamsShape = { notifications: SubscriptionFilterSchema };
+    const subscriptionsListenParamsShape = {
+        notifications: SubscriptionFilterSchema,
+        // Prototype draft vocabulary: client-chosen stream expiry.
+        expiresAt: z.string().optional()
+    };
     const SubscriptionsListenRequestSchema = wireRequest('subscriptions/listen', subscriptionsListenParamsShape);
+    const subscriptionsUpdateParamsShape = {
+        // Prototype draft vocabulary: in-place reauthorization/update stream ID.
+        streamId: z.string(),
+        expiresAt: z.union([z.string(), z.null()]).optional()
+    };
+    const SubscriptionsUpdateRequestSchema = wireRequest('subscriptions/update', subscriptionsUpdateParamsShape);
 
     /**
      * Anchor SubscriptionsListenResultMetaObject — required subscriptionId stamp on
@@ -1089,6 +1103,12 @@ function build() {
         _meta: SubscriptionsListenResultMetaSchema,
         resultType: ResultTypeSchema.default('complete')
     });
+    const SubscriptionsUpdateResultSchema = wireResult({
+        // Prototype draft vocabulary: result for in-place stream reauthorization.
+        expiresAt: z.string().optional(),
+        authorizedUntil: z.string(),
+        lastUpdatedAt: z.string()
+    });
 
     /** Dispatch (post-lift) request schemas, keyed by method — registry-internal. */
     const dispatchRequestSchemas: { readonly [M in Rev2026RequestMethod]: z.ZodType<{ method: M }> } = {
@@ -1104,7 +1124,8 @@ function build() {
         'resources/read': dispatchRequest('resources/read', { uri: z.string() }),
         'completion/complete': dispatchRequest('completion/complete', completeParamsShape),
         'server/discover': dispatchRequest('server/discover', {}),
-        'subscriptions/listen': dispatchRequest('subscriptions/listen', subscriptionsListenParamsShape)
+        'subscriptions/listen': dispatchRequest('subscriptions/listen', subscriptionsListenParamsShape),
+        'subscriptions/update': dispatchRequest('subscriptions/update', subscriptionsUpdateParamsShape)
     };
 
     /** Dispatch (post-lift) result schemas, keyed by method — what the funnel
@@ -1176,7 +1197,12 @@ function build() {
         // the subscriptionId stamp). The dispatch result schema stays the lifted
         // empty body so the mapped type is total; the listen-response demux is
         // entry-layer (`Client._onresponse`) and never reaches `decodeResult`.
-        'subscriptions/listen': liftedResult({})
+        'subscriptions/listen': liftedResult({}),
+        'subscriptions/update': liftedResult({
+            expiresAt: z.string().optional(),
+            authorizedUntil: z.string(),
+            lastUpdatedAt: z.string()
+        })
     };
 
     /* ------------------------------------------------------------------------ *
@@ -1211,9 +1237,25 @@ function build() {
         params: z.object({
             _meta: NotificationMetaSchema.optional(),
             notifications: SubscriptionFilterSchema,
-            // Prototype draft vocabulary: lifetime authorization deadline.
-            authorizedUntil: z.string().optional()
+            // Prototype draft vocabulary: lifetime/lifecycle acknowledgement fields.
+            authorizedUntil: z.string().optional(),
+            expiresAt: z.string().optional(),
+            lastUpdatedAt: z.string().optional(),
+            streamId: z.string().optional()
         })
+    });
+
+    const SubscriptionLifecycleParamsBaseSchema = z
+        .object({
+            _meta: NotificationMetaSchema.optional(),
+            // Prototype draft vocabulary: loose lifecycle notification.
+            type: z.string(),
+            lastUpdatedAt: z.string()
+        })
+        .loose();
+    const SubscriptionLifecycleNotificationSchema = z.object({
+        method: z.literal('notifications/subscriptions/lifecycle'),
+        params: SubscriptionLifecycleParamsBaseSchema
     });
 
     /**
@@ -1251,7 +1293,8 @@ function build() {
         'notifications/resources/list_changed': ResourceListChangedNotificationSchema,
         'notifications/tools/list_changed': ToolListChangedNotificationSchema,
         'notifications/prompts/list_changed': PromptListChangedNotificationSchema,
-        'notifications/subscriptions/acknowledged': SubscriptionsAcknowledgedNotificationSchema
+        'notifications/subscriptions/acknowledged': SubscriptionsAcknowledgedNotificationSchema,
+        'notifications/subscriptions/lifecycle': SubscriptionLifecycleNotificationSchema
     };
 
     /* ------------------------------------------------------------------------ *
@@ -1279,6 +1322,7 @@ function build() {
     const CompleteResultResponseSchema = wireResultResponse(CompleteResultSchema);
     const DiscoverResultResponseSchema = wireResultResponse(DiscoverResultSchema);
     const SubscriptionsListenResultResponseSchema = wireResultResponse(SubscriptionsListenResultSchema);
+    const SubscriptionsUpdateResultResponseSchema = wireResultResponse(SubscriptionsUpdateResultSchema);
 
     return {
         JSONValueSchema,
@@ -1396,12 +1440,16 @@ function build() {
         DiscoverRequestSchema,
         SubscriptionFilterSchema,
         SubscriptionsListenRequestSchema,
+        SubscriptionsUpdateRequestSchema,
         SubscriptionsListenResultMetaSchema,
         SubscriptionsListenResultSchema,
+        SubscriptionsUpdateResultSchema,
         dispatchRequestSchemas,
         dispatchResultSchemas,
         NotificationMetaSchema,
         SubscriptionsAcknowledgedNotificationSchema,
+        SubscriptionLifecycleParamsBaseSchema,
+        SubscriptionLifecycleNotificationSchema,
         CancelledNotificationParamsSchema,
         CancelledNotificationSchema,
         notificationSchemas2026,
@@ -1415,7 +1463,8 @@ function build() {
         ReadResourceResultResponseSchema,
         CompleteResultResponseSchema,
         DiscoverResultResponseSchema,
-        SubscriptionsListenResultResponseSchema
+        SubscriptionsListenResultResponseSchema,
+        SubscriptionsUpdateResultResponseSchema
     };
 }
 

@@ -47,6 +47,8 @@ import type {
     StandardSchemaV1,
     SubscribeRequest,
     SubscriptionFilter,
+    SubscriptionLifecycleNotification,
+    SubscriptionsUpdateResult,
     Tool,
     Transport,
     UnsubscribeRequest,
@@ -105,6 +107,20 @@ import {
 function serverInfoFromDiscover(discover: DiscoverResult): Implementation | undefined {
     const fromMeta = discover._meta?.[SERVER_INFO_META_KEY];
     return isSpecType.Implementation(fromMeta) ? fromMeta : undefined;
+}
+
+function compareRfc3339Timestamps(left: string, right: string): number {
+    const leftTime = Date.parse(left);
+    const rightTime = Date.parse(right);
+    if (Number.isFinite(leftTime) && Number.isFinite(rightTime)) {
+        return leftTime - rightTime;
+    }
+    return left < right ? -1 : left > right ? 1 : 0;
+}
+
+/** True when both timestamps are present and `left` is earlier than `right`. */
+function isEarlierTimestamp(left: string | undefined, right: string | undefined): boolean {
+    return left !== undefined && right !== undefined && compareRfc3339Timestamps(left, right) < 0;
 }
 
 /**
@@ -367,6 +383,17 @@ export type ConnectOptions = RequestOptions & {
 };
 
 /**
+ * Options for {@linkcode Client.listen}. Extends {@linkcode RequestOptions}
+ * with the Subscription Lifecycle SEP expiry requested for the stream.
+ */
+export type ListenOptions = RequestOptions & {
+    /**
+     * When the client no longer wants the stream, as an RFC 3339 UTC timestamp.
+     */
+    expiresAt?: string;
+};
+
+/**
  * Rejects malformed persisted blobs with a typed `SdkError` before any state
  * change: unrecognized `kind`, a legacy verdict also carrying
  * DiscoverResult-shaped members (a corrupt blob must never era-choose), or a
@@ -448,13 +475,38 @@ export interface McpSubscription {
      */
     readonly honoredFilter: SubscriptionFilter;
     /**
-     * The stream's authorization deadline, from the acknowledgment.
+     * The stream's authorization deadline, from the acknowledgment, update
+     * results, and lifecycle reminders, whichever has the latest
+     * `lastUpdatedAt`.
      */
     authorizedUntil?: string;
+    /**
+     * The stream's expiry, from the acknowledgment and update results.
+     */
+    expiresAt?: string;
+    /**
+     * Opaque server-issued stream ID for {@linkcode McpSubscription.update}.
+     */
+    streamId?: string;
+    /**
+     * The latest `lastUpdatedAt` seen for this stream: the time of its most
+     * recent change of expiry, authorization deadline, authorization, or
+     * acknowledged entries.
+     */
+    lastUpdatedAt?: string;
     /**
      * Why the server ended this stream with `AuthorizationEnded`, when known.
      */
     endReason?: 'token_expiry' | 'insufficient_authorization' | 'revoked' | string;
+    /**
+     * Receives `notifications/subscriptions/lifecycle` notifications for this
+     * subscription, except reminders that an update result has superseded.
+     */
+    onlifecycle?: (notification: SubscriptionLifecycleNotification) => void;
+    /**
+     * Re-authorizes or updates this stream in place with `subscriptions/update`.
+     */
+    update(params?: { expiresAt?: string | null }, options?: RequestOptions): Promise<SubscriptionsUpdateResult>;
     /**
      * Tears the subscription down. Idempotent. Aborts the listen request's
      * stream (where the transport supports it) AND sends
@@ -492,11 +544,15 @@ interface ListenStateEntry {
                   ack: {
                       honoredFilter: SubscriptionFilter;
                       authorizedUntil?: string;
+                      expiresAt?: string;
+                      streamId?: string;
+                      lastUpdatedAt?: string;
                   };
               }
             | { cause: 'local' | 'graceful' | 'remote'; error?: Error }
     ) => void;
     setEndReason: (reason: string | undefined) => void;
+    handleLifecycle: (notification: SubscriptionLifecycleNotification) => void;
 }
 
 /**
@@ -1962,7 +2018,7 @@ export class Client extends Protocol<ClientContext> {
      * `resources/subscribe` and `ClientOptions.listChanged` (the legacy
      * unsolicited delivery model still applies there); no transparent shim.
      */
-    async listen(filter: SubscriptionFilter, options?: RequestOptions): Promise<McpSubscription> {
+    async listen(filter: SubscriptionFilter, options?: ListenOptions): Promise<McpSubscription> {
         // Connectivity is checked first so a closed instance rejects with
         // NotConnected (no setup or ack timer is started); after close(),
         // `_resetConnectionState` has also cleared the negotiated era, so the
@@ -2008,6 +2064,10 @@ export class Client extends Protocol<ClientContext> {
         // construction.
         let state: 'opening' | 'open' | 'closed' = 'opening';
         let honoredFilter: SubscriptionFilter = {};
+        let latestUpdateResultLastUpdatedAt: string | undefined;
+        // The lastUpdatedAt of the acknowledgment, update result, or reminder
+        // that last set subscription.authorizedUntil.
+        let authorizedUntilLastUpdatedAt: string | undefined;
         let ackTimer: ReturnType<typeof setTimeout> | undefined;
         let onCallerAbort: (() => void) | undefined;
         let resolveOpening!: () => void;
@@ -2025,6 +2085,24 @@ export class Client extends Protocol<ClientContext> {
             resolveClosed = resolve;
         });
 
+        const advanceLastUpdatedAt = (value: string): void => {
+            if (!isEarlierTimestamp(value, subscription.lastUpdatedAt)) subscription.lastUpdatedAt = value;
+        };
+
+        // Lifecycle SEP §3.2 rule 2: of a reminder and an update result, the
+        // one with the later lastUpdatedAt is current, whichever arrives first.
+        const applyUpdateResult = (result: SubscriptionsUpdateResult): void => {
+            if (!isEarlierTimestamp(result.lastUpdatedAt, latestUpdateResultLastUpdatedAt)) {
+                latestUpdateResultLastUpdatedAt = result.lastUpdatedAt;
+                subscription.expiresAt = result.expiresAt;
+            }
+            if (!isEarlierTimestamp(result.lastUpdatedAt, authorizedUntilLastUpdatedAt)) {
+                subscription.authorizedUntil = result.authorizedUntil;
+                authorizedUntilLastUpdatedAt = result.lastUpdatedAt;
+            }
+            advanceLastUpdatedAt(result.lastUpdatedAt);
+        };
+
         const subscription: McpSubscription = {
             get honoredFilter() {
                 return honoredFilter;
@@ -2034,7 +2112,23 @@ export class Client extends Protocol<ClientContext> {
                 settle({ cause: 'local' });
                 await wireTeardown();
             },
-            closed
+            closed,
+            update: async (params?: { expiresAt?: string | null }, updateOptions?: RequestOptions): Promise<SubscriptionsUpdateResult> => {
+                if (state !== 'open') {
+                    throw new SdkError(SdkErrorCode.ConnectionClosed, 'subscriptions/update requires an open subscription');
+                }
+                const streamId = subscription.streamId;
+                if (streamId === undefined) {
+                    throw new SdkError(
+                        SdkErrorCode.CapabilityNotSupported,
+                        'subscriptions/update requires a streamId from the acknowledgment'
+                    );
+                }
+                const updateParams = params === undefined ? { streamId } : { streamId, ...params };
+                const result = await this.request({ method: 'subscriptions/update', params: updateParams }, updateOptions);
+                applyUpdateResult(result);
+                return result;
+            }
         };
 
         const settle: ListenStateEntry['settle'] = outcome => {
@@ -2050,6 +2144,10 @@ export class Client extends Protocol<ClientContext> {
                 state = 'open';
                 honoredFilter = outcome.ack.honoredFilter;
                 subscription.authorizedUntil = outcome.ack.authorizedUntil;
+                subscription.expiresAt = outcome.ack.expiresAt;
+                subscription.streamId = outcome.ack.streamId;
+                subscription.lastUpdatedAt = outcome.ack.lastUpdatedAt;
+                authorizedUntilLastUpdatedAt = outcome.ack.lastUpdatedAt;
                 resolveOpening();
                 return;
             }
@@ -2088,6 +2186,22 @@ export class Client extends Protocol<ClientContext> {
             await this.notification({ method: 'notifications/cancelled', params: { requestId: listenId } }).catch(() => {});
         };
 
+        const handleLifecycle = (notification: SubscriptionLifecycleNotification): void => {
+            const params = notification.params;
+            // Only a reminder reports state that an update replaces.
+            // access_reduced and missed report events that an update does not
+            // undo, so they are never stale (lifecycle SEP §3.2 rule 2).
+            if (params.type === 'reauthorization_required') {
+                if (isEarlierTimestamp(params.lastUpdatedAt, latestUpdateResultLastUpdatedAt)) return;
+                if ('authorizedUntil' in params && typeof params.authorizedUntil === 'string') {
+                    subscription.authorizedUntil = params.authorizedUntil;
+                    authorizedUntilLastUpdatedAt = params.lastUpdatedAt;
+                }
+            }
+            advanceLastUpdatedAt(params.lastUpdatedAt);
+            subscription.onlifecycle?.(notification);
+        };
+
         // The per-subscription state is registered BEFORE the request is sent
         // so a synchronously-delivered ack (an in-process transport) cannot
         // race the registration.
@@ -2095,7 +2209,8 @@ export class Client extends Protocol<ClientContext> {
             settle,
             setEndReason: reason => {
                 subscription.endReason = reason;
-            }
+            },
+            handleLifecycle
         });
 
         const ackTimeout = options?.timeout ?? DEFAULT_REQUEST_TIMEOUT_MSEC;
@@ -2134,7 +2249,11 @@ export class Client extends Protocol<ClientContext> {
             jsonrpc: '2.0',
             id: listenId,
             method: 'subscriptions/listen',
-            params: { _meta: { ...this._outboundMetaEnvelope() }, notifications: filter }
+            params: {
+                _meta: { ...this._outboundMetaEnvelope() },
+                notifications: filter,
+                ...(options?.expiresAt !== undefined && { expiresAt: options.expiresAt })
+            }
         };
         // The send is NOT serially awaited: `opening` must be the promise
         // listen() suspends on so that a settle() firing while the send is
@@ -2238,11 +2357,26 @@ export class Client extends Protocol<ClientContext> {
                     ack: honored.ok
                         ? {
                               honoredFilter: honored.value.params.notifications,
-                              authorizedUntil: honored.value.params.authorizedUntil
+                              authorizedUntil: honored.value.params.authorizedUntil,
+                              expiresAt: honored.value.params.expiresAt,
+                              streamId: honored.value.params.streamId,
+                              lastUpdatedAt: honored.value.params.lastUpdatedAt
                           }
                         : { honoredFilter: {} }
                 });
                 return;
+            }
+        }
+        if (raw.method === 'notifications/subscriptions/lifecycle') {
+            const params = raw.params as { _meta?: Record<string, unknown> } | undefined;
+            const subscriptionId = params?._meta?.[SUBSCRIPTION_ID_META_KEY];
+            const entry = typeof subscriptionId === 'string' ? this._listenState.get(subscriptionId) : undefined;
+            if (entry !== undefined) {
+                const lifecycle = this._wireCodec().validateNotification('notifications/subscriptions/lifecycle', raw);
+                if (lifecycle.ok) {
+                    entry.handleLifecycle(lifecycle.value as SubscriptionLifecycleNotification);
+                    return;
+                }
             }
         }
         if (raw.method === 'notifications/cancelled') {

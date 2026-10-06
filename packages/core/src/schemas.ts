@@ -942,7 +942,12 @@ export const SubscriptionFilterSchema = z.object({
      * Subscribe to `notifications/resources/updated` for these resource URIs.
      * Replaces the former `resources/subscribe` RPC on the 2026-07-28 revision.
      */
-    resourceSubscriptions: z.array(z.string()).optional()
+    resourceSubscriptions: z.array(z.string()).optional(),
+    /**
+     * Prototype draft vocabulary: if true, receive
+     * `notifications/subscriptions/lifecycle`.
+     */
+    lifecycle: z.boolean().optional()
 });
 
 export const SubscriptionsListenRequestParamsSchema = BaseRequestParamsSchema.extend({
@@ -950,7 +955,12 @@ export const SubscriptionsListenRequestParamsSchema = BaseRequestParamsSchema.ex
      * The notifications the client opts in to on this stream. The server MUST
      * NOT send notification types the client has not explicitly requested.
      */
-    notifications: SubscriptionFilterSchema
+    notifications: SubscriptionFilterSchema,
+    /**
+     * Prototype draft vocabulary: when the client no longer wants the stream,
+     * as an RFC 3339 UTC timestamp.
+     */
+    expiresAt: z.string().optional()
 });
 
 /**
@@ -969,7 +979,13 @@ export const SubscriptionsAcknowledgedNotificationParamsSchema = NotificationsPa
      */
     notifications: SubscriptionFilterSchema,
     /** Prototype draft vocabulary: the stream's authorization deadline. */
-    authorizedUntil: z.string().optional()
+    authorizedUntil: z.string().optional(),
+    /** Prototype draft vocabulary: the stream's expiry. */
+    expiresAt: z.string().optional(),
+    /** Prototype draft vocabulary: stream state last-updated timestamp. */
+    lastUpdatedAt: z.string().optional(),
+    /** Prototype draft vocabulary: opaque stream ID for `subscriptions/update`. */
+    streamId: z.string().optional()
 });
 
 /**
@@ -1006,6 +1022,60 @@ export const SubscriptionsListenResultSchema = ResultSchema.extend({
 
 /** Prototype draft vocabulary: why a stream needs or ended authorization. */
 export const AuthorizationReasonSchema = z.string();
+
+/** Prototype draft vocabulary: lifecycle notification base params. */
+export const SubscriptionLifecycleParamsBaseSchema = NotificationsParamsSchema.extend({
+    type: z.string(),
+    lastUpdatedAt: z.string()
+}).loose();
+
+/** Prototype draft vocabulary: reauthorization reminder lifecycle params. */
+export const ReauthorizationRequiredLifecycleParamsSchema = SubscriptionLifecycleParamsBaseSchema.extend({
+    type: z.literal('reauthorization_required'),
+    authorizedUntil: z.string(),
+    reason: AuthorizationReasonSchema
+});
+
+/** Prototype draft vocabulary: access-reduced lifecycle params. */
+export const AccessReducedLifecycleParamsSchema = SubscriptionLifecycleParamsBaseSchema.extend({
+    type: z.literal('access_reduced'),
+    removed: SubscriptionFilterSchema
+});
+
+/** Prototype draft vocabulary: missed lifecycle params. */
+export const MissedLifecycleParamsSchema = SubscriptionLifecycleParamsBaseSchema.extend({
+    type: z.literal('missed')
+});
+
+/** Prototype draft vocabulary: subscription lifecycle notification. */
+export const SubscriptionLifecycleNotificationSchema = NotificationSchema.extend({
+    method: z.literal('notifications/subscriptions/lifecycle'),
+    params: z.union([
+        ReauthorizationRequiredLifecycleParamsSchema,
+        AccessReducedLifecycleParamsSchema,
+        MissedLifecycleParamsSchema,
+        SubscriptionLifecycleParamsBaseSchema
+    ])
+});
+
+/** Prototype draft vocabulary: params for `subscriptions/update`. */
+export const SubscriptionsUpdateRequestParamsSchema = BaseRequestParamsSchema.extend({
+    streamId: z.string(),
+    expiresAt: z.union([z.string(), z.null()]).optional()
+});
+
+/** Prototype draft vocabulary: update an open subscription stream in place. */
+export const SubscriptionsUpdateRequestSchema = RequestSchema.extend({
+    method: z.literal('subscriptions/update'),
+    params: SubscriptionsUpdateRequestParamsSchema
+});
+
+/** Prototype draft vocabulary: result of `subscriptions/update`. */
+export const SubscriptionsUpdateResultSchema = ResultSchema.extend({
+    expiresAt: z.string().optional(),
+    authorizedUntil: z.string(),
+    lastUpdatedAt: z.string()
+});
 
 /**
  * Parameters for a {@linkcode ResourceUpdatedNotification | notifications/resources/updated} notification.
@@ -2415,6 +2485,7 @@ export const ClientRequestSchema = z.union([
     SubscribeRequestSchema,
     UnsubscribeRequestSchema,
     SubscriptionsListenRequestSchema,
+    SubscriptionsUpdateRequestSchema,
     CallToolRequestSchema,
     ListToolsRequestSchema
 ]);
@@ -2445,6 +2516,7 @@ export const ServerNotificationSchema = z.union([
     ResourceListChangedNotificationSchema,
     ToolListChangedNotificationSchema,
     PromptListChangedNotificationSchema,
+    SubscriptionLifecycleNotificationSchema,
     SubscriptionsAcknowledgedNotificationSchema,
     ElicitationCompleteNotificationSchema
 ]);
@@ -2461,5 +2533,6 @@ export const ServerResultSchema = z.union([
     ReadResourceResultSchema,
     CallToolResultSchema,
     ListToolsResultSchema,
-    SubscriptionsListenResultSchema
+    SubscriptionsListenResultSchema,
+    SubscriptionsUpdateResultSchema
 ]);
